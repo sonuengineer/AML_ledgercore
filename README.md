@@ -69,6 +69,10 @@ the failure, the measurement and the fix.
   ([PHASE9_OBSERVABILITY.md](PHASE9_OBSERVABILITY.md)).
 - Circuit breaker, load shedding, timeout budget, graceful drain that exits 0
   ([PHASE10_FAILURE_HANDLING.md](PHASE10_FAILURE_HANDLING.md)).
+- Deploy strategies measured rather than described: an all-at-once restart under
+  load produced **15,348 errors**, the same three nodes rolled one at a time
+  produced **0**. Canary and blue-green cutover/rollback measured too
+  ([PHASE13_CICD.md](PHASE13_CICD.md)).
 
 ---
 

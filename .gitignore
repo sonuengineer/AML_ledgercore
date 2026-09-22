@@ -38,6 +38,7 @@
 !/PHASE10_FAILURE_HANDLING.md
 !/PHASE11_AWS.md
 !/PHASE12_DOCKER.md
+!/PHASE13_CICD.md
 
 # NOT re-admitted, pending an explicit decision (see README):
 #   PHASE0_DOMAIN_ANALYSIS.md  -- analyses the legacy system
