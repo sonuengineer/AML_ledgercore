@@ -1,6 +1,49 @@
+import { createSecretKey } from 'node:crypto';
 import jwt, { type JwtPayload, type SignOptions } from 'jsonwebtoken';
 import { config } from '../../config';
 import { UnauthorizedError } from '../../shared/errors/AppError';
+
+/**
+ * The signing secret as a KeyObject, built ONCE at module load.
+ *
+ * This is a four-line change that removed a quarter of the API's CPU, and the
+ * only way it was ever going to be found is a profiler.
+ *
+ * Phase 14 CPU profile of a node under load, by self time:
+ *
+ *   (idle)                                   26.8%
+ *   createPublicKey [node:internal/crypto]   25.5%   <- here
+ *   @prisma/client                            7.7%
+ *   express                                   4.1%
+ *
+ * `createPublicKey` has no business running on an HS256 path at all. HS256 is
+ * a symmetric HMAC; there is no public key anywhere in this system.
+ *
+ * It comes from jsonwebtoken 9's key handling (verify.js:120):
+ *
+ *   if (secretOrPublicKey != null && !(secretOrPublicKey instanceof KeyObject)) {
+ *     try {
+ *       secretOrPublicKey = createPublicKey(secretOrPublicKey);   // line 122
+ *     } catch (_) {
+ *       secretOrPublicKey = createSecretKey(...);                 // line 125
+ *     }
+ *   }
+ *
+ * Pass a STRING and every single verify attempts to parse that string as a
+ * PEM/DER public key, fails, THROWS, and only then falls back to the symmetric
+ * path that was correct all along. An exception constructed and unwound on
+ * every authenticated request, plus a full key-parse attempt, purely to
+ * discover something the code already knew.
+ *
+ * Pass a KeyObject and `instanceof KeyObject` short-circuits the whole block.
+ *
+ * The wider lesson: this cost nothing to write and was invisible in every
+ * metric we had. `http_request_duration` said 114ms, `db_query_duration` said
+ * 106ms of it was "the database", and Postgres itself executed the query in
+ * 0.385ms. Aggregate metrics tell you WHERE time is spent by layer. Only a
+ * profiler tells you what the CPU is actually doing.
+ */
+const jwtKey = createSecretKey(Buffer.from(config.auth.jwtSecret, 'utf8'));
 
 /**
  * Access token issuing and verification.
@@ -94,7 +137,7 @@ export const issueAccessToken = (input: IssueAccessTokenInput): IssuedToken => {
     audience: config.auth.audience,
   };
 
-  const token = jwt.sign(claims, config.auth.jwtSecret, options);
+  const token = jwt.sign(claims, jwtKey, options);
 
   return {
     token,
@@ -107,7 +150,7 @@ export const verifyAccessToken = (token: string): AccessTokenClaims => {
   let payload: string | JwtPayload;
 
   try {
-    payload = jwt.verify(token, config.auth.jwtSecret, {
+    payload = jwt.verify(token, jwtKey, {
       // Pinning the algorithm is not optional. Without it, a token signed with
       // `alg: none` (or an RS256/HS256 confusion) can be accepted.
       algorithms: ['HS256'],

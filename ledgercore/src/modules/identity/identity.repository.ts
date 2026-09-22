@@ -27,14 +27,88 @@ export const findUserByStaffCode = async (
     include: { role: true, homeBranch: true },
   });
 
+/**
+ * JSON has no Date, so a cache hit returns ISO STRINGS where the type says
+ * Date -- and `cached<T>` casts with `as T`, so the compiler happily agrees
+ * with a lie. Every date has to be put back by hand.
+ *
+ * This is not hypothetical here. `authenticate.ts` compares the token's `pwd`
+ * claim against `passwordChangedAt.getTime()` -- the Phase 4 fix that stops a
+ * stale access token surviving a password change. On a cache hit without this
+ * function, `passwordChangedAt` is a string, `.getTime` is undefined, and that
+ * check throws. The same trap was already handled for the business date in
+ * Phase 6; this is the same discipline applied to a security-critical field.
+ */
+const reviveUserDates = (row: UserWithRoleAndBranch): UserWithRoleAndBranch => ({
+  ...row,
+  passwordChangedAt: new Date(row.passwordChangedAt),
+  lockedUntil: row.lockedUntil ? new Date(row.lockedUntil) : null,
+  lastLoginAt: row.lastLoginAt ? new Date(row.lastLoginAt) : null,
+  createdAt: new Date(row.createdAt),
+  updatedAt: new Date(row.updatedAt),
+  role: {
+    ...row.role,
+    createdAt: new Date(row.role.createdAt),
+    updatedAt: new Date(row.role.updatedAt),
+  },
+  homeBranch: {
+    ...row.homeBranch,
+    openedOn: new Date(row.homeBranch.openedOn),
+    createdAt: new Date(row.homeBranch.createdAt),
+    updatedAt: new Date(row.homeBranch.updatedAt),
+  },
+});
+
+/**
+ * Cached, with a DELIBERATELY SHORT ttl.
+ *
+ * WHY AT ALL: this runs on every authenticated request. The Phase 14 profile,
+ * after the JWT fix, put @prisma/client at 14.6% of CPU and this was almost
+ * all of it -- one round trip through the Rust query engine, for a row that
+ * changes perhaps twice a day.
+ *
+ * WHY 10 SECONDS AND NOT THE 300s DEFAULT: the value being cached is the
+ * user's CURRENT security state -- status, lock, role, passwordChangedAt.
+ * Phase 4 chose to re-read it per request precisely so that disabling an
+ * account takes effect immediately rather than at token expiry. Caching it
+ * weakens that, so the window is made small enough to stay operationally
+ * equivalent: "we disabled them and it took under ten seconds" is a different
+ * sentence from "it took up to fifteen minutes".
+ *
+ * WHY THE WINDOW IS SMALLER THAN 10s IN PRACTICE: every write path in this
+ * file calls `invalidateUser`, so an in-application change is visible at once.
+ * The 10 seconds only ever applies to a change made OUTSIDE the application --
+ * a DBA running UPDATE by hand, or a replica lag.
+ *
+ * The permission cache (5 minutes, keyed by role) already made this exact
+ * trade in Phase 6. This is the same pattern with a tighter bound, because the
+ * data is more dangerous.
+ */
 export const findUserById = async (
   id: string,
   db: TxClient = prisma,
-): Promise<UserWithRoleAndBranch | null> =>
-  db.user.findUnique({
-    where: { id },
-    include: { role: true, homeBranch: true },
-  });
+): Promise<UserWithRoleAndBranch | null> => {
+  const row = await cached(
+    cacheKeys.user(id),
+    async () =>
+      db.user.findUnique({
+        where: { id },
+        include: { role: true, homeBranch: true },
+      }),
+    { ttlSeconds: 10 },
+  );
+  return row ? reviveUserDates(row) : null;
+};
+
+/**
+ * Call after ANY write that changes a user row.
+ *
+ * The dangerous one is `recordFailedLogin`, which flips status to LOCKED.
+ * Without this, a locked-out account would keep passing `authenticate` until
+ * the entry expired -- the account lockout would be advisory for ten seconds.
+ */
+export const invalidateUser = async (userId: string): Promise<void> =>
+  invalidate(cacheKeys.user(userId));
 
 /**
  * Resolve the permission codes a user holds, via their role.
@@ -139,6 +213,7 @@ export const updatePasswordHash = async (
           : {}),
       },
     });
+    await invalidateUser(userId);
   } catch (error) {
     translateDbError(error, 'User');
   }
@@ -151,6 +226,7 @@ export const recordSuccessfulLogin = async (userId: string, db: TxClient = prism
       where: { id: userId },
       data: { lastLoginAt: new Date(), failedLoginCount: 0, lockedUntil: null },
     });
+    await invalidateUser(userId);
   } catch (error) {
     translateDbError(error, 'User');
   }
@@ -185,6 +261,10 @@ export const recordFailedLogin = async (
            updated_at = now()
      WHERE id = ${userId}::uuid
   `;
+  // NOT optional: this statement can set status = 'LOCKED'. Without the
+  // invalidation an account lockout would be advisory until the entry
+  // expired -- which defeats the lockout.
+  await invalidateUser(userId);
 };
 
 export type { User, UserStatus };

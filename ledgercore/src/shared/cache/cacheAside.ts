@@ -203,6 +203,7 @@ export const invalidatePrefix = async (prefix: string): Promise<number> =>
 
 /** Key builders. Centralised so an invalidation cannot miss a spelling. */
 export const cacheKeys = {
+  user: (userId: string): string => `user:${userId}`,
   rolePermissions: (roleId: string): string => `perm:role:${roleId}`,
   rolePermissionsPrefix: 'perm:role:',
   product: (productId: string): string => `product:${productId}`,
