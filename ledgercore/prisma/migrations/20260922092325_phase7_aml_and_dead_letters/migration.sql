@@ -5,7 +5,25 @@ CREATE TYPE "aml_rule_kind" AS ENUM ('CASH_THRESHOLD', 'STRUCTURING', 'VELOCITY'
 CREATE TYPE "alert_status" AS ENUM ('OPEN', 'UNDER_REVIEW', 'ESCALATED', 'CLOSED_NO_ACTION', 'REVERTED');
 
 -- DropIndex
-DROP INDEX "customer_full_name_trgm_idx";
+--
+-- `IF EXISTS`, added after the first CI run that ever replayed this chain
+-- against an empty database. Without it, `prisma migrate deploy` dies here:
+--
+--   Error: P3018  A migration failed to apply.
+--   Database error code: 42704
+--   ERROR: index "customer_full_name_trgm_idx" does not exist
+--
+-- The index was created in 20260921070835_phase5_ledger and then dropped in
+-- 20260921072746_phase5_voucher_list_index -- that drop is the `prisma
+-- migrate diff` bug documented in PHASE7_ASYNC.md. By the time this
+-- migration runs on a FRESH database the index is already gone, so an
+-- unconditional DROP fails and the whole chain stops before
+-- 20260922092421_restore_handwritten_objects can put the indexes back.
+--
+-- It never failed locally because when this migration was first applied the
+-- index did exist -- an ad-hoc EXPLAIN script had recreated it by hand. The
+-- developer database was therefore reproducible only from itself.
+DROP INDEX IF EXISTS "customer_full_name_trgm_idx";
 
 -- CreateTable
 CREATE TABLE "aml_rule" (
