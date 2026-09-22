@@ -73,6 +73,11 @@ the failure, the measurement and the fix.
   load produced **15,348 errors**, the same three nodes rolled one at a time
   produced **0**. Canary and blue-green cutover/rollback measured too
   ([PHASE13_CICD.md](PHASE13_CICD.md)).
+- Five simulated incidents found **three resilience controls that were written,
+  unit-tested and never connected to anything** -- including a circuit breaker
+  the docs credited with protecting the system. A *hung* cache turned out to be
+  2.4x more damaging than a dead one, and invisible to every alert
+  ([PHASE16_INCIDENTS.md](PHASE16_INCIDENTS.md)).
 - The write path sustains **5-6 postings/sec per branch** and does not improve
   with concurrency, because a gapless daily voucher number must be allocated
   inside the transaction. Gapless numbering and concurrent posting are in
