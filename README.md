@@ -73,6 +73,11 @@ the failure, the measurement and the fix.
   load produced **15,348 errors**, the same three nodes rolled one at a time
   produced **0**. Canary and blue-green cutover/rollback measured too
   ([PHASE13_CICD.md](PHASE13_CICD.md)).
+- The write path sustains **5-6 postings/sec per branch** and does not improve
+  with concurrency, because a gapless daily voucher number must be allocated
+  inside the transaction. Gapless numbering and concurrent posting are in
+  direct conflict; `pg_locks` shows the queue
+  ([PHASE15_SCALE.md](PHASE15_SCALE.md)).
 - **6.1x throughput** from two changes a profiler found and no metric showed:
   `createPublicKey` was 25.5% of CPU on an HS256-only code path, and the
   per-request user read was the rest. 173 -> 1,064 rps, p99 309 -> 123ms
