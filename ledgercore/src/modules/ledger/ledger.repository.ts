@@ -221,7 +221,31 @@ export const nextVoucherNumber = async (
    */
   const rows = await db.$queryRaw<Array<{ last_seq: number }>>`
     INSERT INTO voucher_sequence (branch_id, entry_date, last_seq)
-    VALUES (${branchId}::uuid, ${datePart}::date, 1)
+    VALUES (
+      ${branchId}::uuid,
+      ${datePart}::date,
+      -- NOT the literal 1.
+      --
+      -- CI caught this on the very first run against a fresh database:
+      --
+      --   Unique constraint failed on the fields: (voucher_number)
+      --
+      -- The migration backfills the counter from numbers already issued, but
+      -- a database created AFTER that migration gets its vouchers from the
+      -- seed script, which writes voucher_number directly. The counter knew
+      -- nothing about them, started at 1, and collided on the first posting.
+      -- It passed locally only because this developer's migration ran after
+      -- the data already existed.
+      --
+      -- Seeding the row from the real maximum makes the counter self-healing
+      -- for ANY voucher inserted outside this function -- a seed, a data fix,
+      -- a restore. This is the O(n) scan the counter exists to avoid, but it
+      -- runs ONCE per branch per day rather than once per posting.
+      COALESCE(
+        (SELECT MAX(SUBSTRING(voucher_number FROM ${prefix.length + 1}::int)::int)
+           FROM voucher
+          WHERE voucher_number LIKE ${`${prefix}%`}), 0) + 1
+    )
     ON CONFLICT (branch_id, entry_date)
     DO UPDATE SET last_seq = voucher_sequence.last_seq + 1
     RETURNING last_seq
