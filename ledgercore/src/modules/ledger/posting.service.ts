@@ -286,6 +286,7 @@ export const createVoucher = async (
 
     // ---- write ------------------------------------------------------------
     const voucherNumber = await repo.nextVoucherNumber(
+      context.branchId,
       context.branchCode,
       context.workingDate,
       tx,
@@ -629,6 +630,7 @@ export const reverseVoucher = async (
     );
 
     const voucherNumber = await repo.nextVoucherNumber(
+      context.branchId,
       context.branchCode,
       context.workingDate,
       tx,

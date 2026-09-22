@@ -48,6 +48,7 @@ describe('hand-written indexes survive migrations', () => {
     ['outbox_pending_idx', 'the outbox relay poll'],
     ['account_frozen_idx', 'freeze checks on the posting path'],
     ['batch_open_idx', 'open-batch lookup per branch'],
+    ['voucher_posted_post_date_idx', 'the AML rolling-window aggregate'],
   ])('%s exists (%s)', async (name) => {
     expect(await indexExists(name)).toBe(true);
   });
@@ -81,6 +82,7 @@ describe('hand-written indexes survive migrations', () => {
       'outbox_claimable_idx',
       'outbox_pending_idx',
       'voucher_pending_queue_idx',
+      'voucher_posted_post_date_idx',
     ]);
   });
 });

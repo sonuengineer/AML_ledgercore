@@ -86,8 +86,13 @@ interface WindowAggregate {
  * a parameter so CASH_THRESHOLD looks only at cash while STRUCTURING looks at
  * everything.
  *
- * Bounded by `post_date`, so the partition pruning from Phase 5 applies --
- * a 30-day window reads one partition, not the whole ledger.
+ * Bounded by `post_date` on BOTH sides of the join.
+ *
+ * The original version bounded only voucher_line. That table is range
+ * partitioned and did prune correctly, which is why the comment claiming "a
+ * 30-day window reads one partition, not the whole ledger" looked right. The
+ * voucher table it joins to is not partitioned and had no date predicate, so
+ * every AML job seq scanned all 200k vouchers.
  */
 const aggregateWindow = async (
   customerId: string,
@@ -106,6 +111,12 @@ const aggregateWindow = async (
        AND vl.dr_cr = 'DEBIT'
        AND v.status = 'POSTED'
        AND vl.post_date BETWEEN ${fromDate} AND ${toDate}
+       -- The SAME bound on the voucher side. Without it the join had no date
+       -- predicate and Postgres seq scanned all 200k vouchers on every AML
+       -- job -- see the voucher_posted_post_date_idx migration. A voucher's
+       -- lines carry its post_date, so this narrows the join without changing
+       -- which rows qualify.
+       AND v.post_date BETWEEN ${fromDate} AND ${toDate}
        AND (${transactionType}::text IS NULL OR v.transaction_type::text = ${transactionType})
   `;
 

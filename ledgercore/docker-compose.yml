@@ -221,7 +221,10 @@ services:
       REDIS_URL: redis://redis:6379
       QUEUE_REDIS_URL: redis://redis-queue:6379
       CACHE_ENABLED: "true"
-      RATE_LIMIT_ENABLED: "true"
+      # Configurable so a capacity experiment can turn it off. The limit is a
+      # PRODUCT control (60 postings/min per operator, Phase 6), not a capacity
+      # limit -- leaving it on while measuring throughput measures the limiter.
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-true}"
       CORS_ORIGINS: http://localhost:5173,http://localhost:3000,http://localhost:3002
       BODY_LIMIT: 256kb
       WORKER_METRICS_PORT: 9101

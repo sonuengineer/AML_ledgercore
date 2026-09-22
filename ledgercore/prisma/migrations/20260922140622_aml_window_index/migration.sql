@@ -1,0 +1,34 @@
+-- AML screening: stop scanning the entire voucher table on every posting.
+--
+-- WHAT WAS WRONG
+--
+-- aggregateWindow() sums a customer's debits over a rolling window. Its
+-- comment said the Phase 5 partitioning applied -- "a 30-day window reads one
+-- partition, not the whole ledger". That is true of voucher_line, which IS
+-- range partitioned on post_date and does prune. It is NOT true of the voucher
+-- table it joins to, which is not partitioned and carried no date predicate at
+-- all. Measured at 200,439 vouchers:
+--
+--   Parallel Seq Scan on voucher v
+--     Filter: (status = 'POSTED')
+--     actual rows=67374 loops=3        -- 202,122 rows: the whole table
+--
+-- One full table scan per posting, growing forever, on a job the posting path
+-- enqueues for every single voucher. A burst of ~2,000 postings pushed Postgres
+-- to 594% CPU and dragged the unrelated READ path from 849 rps down to 176.
+--
+-- This is the more interesting half of the bug: the write path's real cost is
+-- not only its own transaction, it is the downstream work each posting
+-- creates. The ledger looked fine. The database did not.
+--
+-- THE FIX has two halves; this is the index, the query adds the matching
+-- `v.post_date BETWEEN` predicate. Without both, the predicate still seq
+-- scans and the index is never chosen.
+--
+-- Partial, because the aggregate only ever counts POSTED vouchers, and because
+-- Prisma's schema language cannot express a partial index -- so like the
+-- trigram indexes, it is asserted by tests/schema.int.test.ts rather than by
+-- schema.prisma.
+CREATE INDEX "voucher_posted_post_date_idx"
+    ON "voucher" ("post_date")
+ WHERE "status" = 'POSTED';

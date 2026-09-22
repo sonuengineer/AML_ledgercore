@@ -187,27 +187,47 @@ export const readAvailableBalance = async (
  * releases at COMMIT with no cleanup path to forget.
  */
 export const nextVoucherNumber = async (
+  branchId: string,
   branchCode: number,
   entryDate: Date,
   db: TxClient,
 ): Promise<string> => {
-  const datePart = entryDate.toISOString().slice(0, 10).replace(/-/g, '');
-  const prefix = `V${branchCode}-${datePart}-`;
+  const datePart = entryDate.toISOString().slice(0, 10);
+  const prefix = `V${branchCode}-${datePart.replace(/-/g, '')}-`;
 
-  // Two 32-bit keys: branch code, and the date as YYYYMMDD.
-  await db.$executeRaw`SELECT pg_advisory_xact_lock(${branchCode}::int, ${Number(datePart)}::int)`;
-
-  const rows = await db.$queryRaw<Array<{ seq: number }>>`
-    -- The ::int cast on the parameter is required, not cosmetic. Prisma binds
-    -- a JS number as bigint, and there is no substring(varchar, bigint) --
-    -- Postgres answers with 42883 "function does not exist", which reads like
-    -- a syntax error but is a parameter-typing problem.
-    SELECT COALESCE(MAX(SUBSTRING(voucher_number FROM ${prefix.length + 1}::int)::int), 0) + 1 AS seq
-      FROM voucher
-     WHERE voucher_number LIKE ${`${prefix}%`}
+  /**
+   * One row per (branch, date), incremented in place.
+   *
+   * This replaced a `MAX(SUBSTRING(...)) ... WHERE voucher_number LIKE 'p%'`
+   * that scanned the ENTIRE voucher index on every posting -- 19.7ms at
+   * 200,439 vouchers, growing forever, and executed while holding the lock
+   * that serialises the posting path. See the migration for the EXPLAIN.
+   *
+   * `ON CONFLICT DO UPDATE` is atomic and takes a row lock on exactly this
+   * (branch, date), which is the same mutual exclusion the previous
+   * `pg_advisory_xact_lock` provided -- so that lock is gone, not merely
+   * duplicated. Two branches still never contend.
+   *
+   * Gaplessness is preserved BECAUSE this runs inside the posting
+   * transaction: a voucher that rolls back rolls its number back with it.
+   * That is the property a Postgres sequence cannot give, since `nextval` is
+   * non-transactional and a failed voucher would burn its number.
+   *
+   * It does NOT remove the serialisation. A gapless per-day counter is a
+   * single point every posting in that branch must pass through, and the row
+   * lock is held until COMMIT. What it removes is the growing WORK inside that
+   * critical section. See PHASE15 for what it would take to remove the
+   * serialisation itself.
+   */
+  const rows = await db.$queryRaw<Array<{ last_seq: number }>>`
+    INSERT INTO voucher_sequence (branch_id, entry_date, last_seq)
+    VALUES (${branchId}::uuid, ${datePart}::date, 1)
+    ON CONFLICT (branch_id, entry_date)
+    DO UPDATE SET last_seq = voucher_sequence.last_seq + 1
+    RETURNING last_seq
   `;
 
-  const seq = rows[0]?.seq ?? 1;
+  const seq = rows[0]?.last_seq ?? 1;
   return `${prefix}${String(seq).padStart(5, '0')}`;
 };
 

@@ -1051,3 +1051,18 @@ model DeadLetter {
   @@index([replayedAt])
   @@map("dead_letter")
 }
+
+/// Per-branch, per-day voucher counter.
+///
+/// Declared here even though it is only ever read and written through raw SQL,
+/// because Phase 7 learned the hard way that `prisma migrate diff` silently
+/// DROPS objects the schema does not know about. A table that exists only in a
+/// migration is a table the next migration deletes.
+model VoucherSequence {
+  branchId  String   @map("branch_id") @db.Uuid
+  entryDate DateTime @map("entry_date") @db.Date
+  lastSeq   Int      @map("last_seq")
+
+  @@id([branchId, entryDate])
+  @@map("voucher_sequence")
+}
