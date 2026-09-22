@@ -251,3 +251,47 @@ describe('distributed lock', () => {
     expect(attempts.filter((result) => result.status === 'rejected')).toHaveLength(4);
   });
 });
+
+
+/**
+ * Phase 16 regression.
+ *
+ * JSON has no Date and no Decimal, and `cached<T>` casts with `as T`, so a
+ * cache HIT can hand back a string where the type promises a rich object --
+ * and the compiler agrees. That trap cost 2,116 silently dead-lettered AML
+ * evaluations before anyone noticed.
+ *
+ * The property being asserted is not "revive works". It is that a MISS and a
+ * HIT return the SAME SHAPE. When they differ, code works until the cache
+ * warms up, which is the worst possible failure schedule.
+ */
+describe('cached() revive keeps miss and hit shapes identical', () => {
+  it('returns a real Date on both the miss and the hit', async () => {
+    const key = `lc:test:revive:${Date.now()}`;
+    const loader = async (): Promise<{ when: Date }> => ({ when: new Date('2026-01-02T03:04:05.000Z') });
+    const revive = (raw: unknown): { when: Date } => ({ when: new Date((raw as { when: string }).when) });
+
+    const miss = await cached(key, loader, { ttlSeconds: 30, revive });
+    const hit = await cached(key, loader, { ttlSeconds: 30, revive });
+
+    expect(miss.when).toBeInstanceOf(Date);
+    expect(hit.when).toBeInstanceOf(Date);
+    expect(hit.when.getTime()).toBe(miss.when.getTime());
+
+    await invalidate(key);
+  });
+
+  it('WITHOUT revive, the hit is a string while the type says Date -- the trap', async () => {
+    const key = `lc:test:trap:${Date.now()}`;
+    const loader = async (): Promise<{ when: Date }> => ({ when: new Date('2026-01-02T03:04:05.000Z') });
+
+    const miss = await cached(key, loader, { ttlSeconds: 30 });
+    const hit = await cached(key, loader, { ttlSeconds: 30 });
+
+    expect(miss.when).toBeInstanceOf(Date);
+    // Documents the hazard rather than hiding it: the compiler says Date here.
+    expect(typeof (hit.when as unknown)).toBe('string');
+
+    await invalidate(key);
+  });
+});

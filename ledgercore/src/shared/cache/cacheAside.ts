@@ -50,10 +50,36 @@ const log = moduleLogger('cache');
  * explain that refusal is worth more than the latency it costs.
  */
 
-export interface CacheOptions {
+export interface CacheOptions<T = unknown> {
   ttlSeconds?: number;
   /** Skip the cache entirely for this call. Used by admin reads that must be fresh. */
   bypass?: boolean;
+
+  /**
+   * Rebuild non-JSON types after a cache round trip.
+   *
+   * REQUIRED whenever the cached value contains a Date, a Prisma Decimal, a
+   * Buffer, a Map, or anything else JSON flattens. Not enforceable by the
+   * compiler, which is exactly why this comment is long.
+   *
+   * `cached<T>` parses with JSON.parse and casts with `as T`. The type then
+   * says Date or Decimal while the runtime value is a string, and TypeScript
+   * agrees with the lie. This has now bitten three times:
+   *
+   *   1. business date (Phase 6)  -- caught, revived by hand at the call site
+   *   2. user record   (Phase 14) -- passwordChangedAt.getTime(), caught in review
+   *   3. AML rules     (Phase 16) -- NOT caught. rule.threshold.toFixed(2)
+   *      threw on every cache hit where a rule actually fired, and 2,116 AML
+   *      evaluations dead-lettered silently. For a bank that is a compliance
+   *      failure, not a bug report.
+   *
+   * It is applied to the LOADER result as well as to the cache hit, on
+   * purpose. If it ran only on hits, a miss would return a Decimal and a hit
+   * would return a string -- the shapes would differ depending on cache state,
+   * which is precisely how (3) stayed invisible until a rule crossed its
+   * threshold.
+   */
+  revive?: (raw: unknown) => T;
 }
 
 interface CacheStats {
@@ -94,7 +120,7 @@ const inFlight = new Map<string, Promise<unknown>>();
 export const cached = async <T>(
   key: string,
   loader: () => Promise<T>,
-  options: CacheOptions = {},
+  options: CacheOptions<T> = {},
 ): Promise<T> => {
   if (!config.cache.enabled || options.bypass) return loader();
 
@@ -110,7 +136,8 @@ export const cached = async <T>(
     try {
       stats.hits += 1;
       cacheOperations.inc({ result: 'hit' });
-      return JSON.parse(hit) as T;
+      const parsed = JSON.parse(hit) as T;
+      return options.revive ? options.revive(parsed) : parsed;
     } catch {
       // A corrupt entry is not a reason to fail the request. Drop it and
       // reload -- self-healing beats an error the caller cannot act on.
@@ -129,7 +156,9 @@ export const cached = async <T>(
 
   const promise = (async (): Promise<T> => {
     try {
-      const value = await loader();
+      // Applied to the loader result too -- see `revive` above for why the
+      // miss path must produce the same shape as the hit path.
+      const value = options.revive ? options.revive(await loader()) : await loader();
 
       // Fire and forget. The response must not wait on the cache write, and a
       // failed write is a missed optimisation, not a failed request.

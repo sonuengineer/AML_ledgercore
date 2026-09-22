@@ -21,6 +21,12 @@
     "sourceMap": true,
     "declaration": false
   },
-  "include": ["src/**/*.ts", "prisma/**/*.ts", "tests/**/*.ts"],
+  "include": ["src/**/*.ts", "prisma/**/*.ts", "tests/**/*.ts",
+    // Operator tooling was NOT typechecked until Phase 16, which is how
+    // scripts/replay-dlq.ts shipped importing a `closeQueues` that does not
+    // exist. `pnpm typecheck` passed, CI passed, and the script died on its
+    // first run. A tool an operator reaches for during an incident is the
+    // worst possible place for an untypechecked import.
+    "scripts/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

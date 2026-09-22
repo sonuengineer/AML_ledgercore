@@ -115,7 +115,38 @@ const baseClient = new PrismaClient({
 });
 
 baseClient.$on('warn', (event: Prisma.LogEvent) => log.warn({ target: event.target }, event.message));
-baseClient.$on('error', (event: Prisma.LogEvent) => log.error({ target: event.target }, event.message));
+/**
+ * Prisma reports EVERY driver error here, including ones the application
+ * catches and handles as a normal outcome. It has no idea whether the caller
+ * dealt with it.
+ *
+ * Phase 16 replayed 100 dead letters and the worker logged 100 "job completed"
+ * -- alongside 526 ERROR lines reading:
+ *
+ *   Unique constraint failed on the fields: (dedupe_key)
+ *
+ * That constraint is the AML idempotency guard doing exactly its job: a
+ * re-evaluated voucher hits it instead of raising a duplicate alert, and the
+ * application catches P2002 and logs at DEBUG. Nothing was wrong. The error
+ * log said otherwise, five hundred times.
+ *
+ * That is how operators learn to ignore an error log, and how any "errors per
+ * minute" alert becomes noise. Expected constraint violations are demoted to
+ * debug; everything else still logs at error.
+ *
+ * P2002 unique violation and P2025 record-not-found are BOTH outcomes this
+ * codebase handles deliberately -- the idempotency claim in Phase 10 is built
+ * on P2002 succeeding-by-failing.
+ */
+const EXPECTED_DB_ERRORS = ['Unique constraint failed', 'An operation failed because it depends on'];
+
+baseClient.$on('error', (event: Prisma.LogEvent) => {
+  if (EXPECTED_DB_ERRORS.some((fragment) => event.message.includes(fragment))) {
+    log.debug({ target: event.target }, event.message);
+    return;
+  }
+  log.error({ target: event.target }, event.message);
+});
 
 /**
  * Query timing via a client extension rather than `$on('query')`.

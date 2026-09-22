@@ -21,6 +21,8 @@
     "db:generate": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
     "db:seed:all": "pnpm db:seed && pnpm db:seed:ledger && pnpm db:seed:aml",
+    "dlq:list": "tsx scripts/replay-dlq.ts",
+    "dlq:replay": "tsx scripts/replay-dlq.ts --replay",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset --force",
     "test:int": "vitest run --config vitest.int.config.ts",

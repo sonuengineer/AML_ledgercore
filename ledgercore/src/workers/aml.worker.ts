@@ -66,11 +66,35 @@ interface EventPayload {
 
 const RULE_CACHE_TTL = 300;
 
+/**
+ * Active rules, cached -- WITH an explicit reviver.
+ *
+ * The reviver is not optional decoration. `threshold` is a Prisma Decimal, and
+ * JSON has no Decimal, so on a cache HIT it came back as a string while the
+ * type still said Decimal. `total.lessThan(rule.threshold)` tolerated that,
+ * because decimal.js accepts a string -- so the comparison worked and the bug
+ * stayed hidden. `rule.threshold.toFixed(2)`, three lines further on in the
+ * branch that RAISES the alert, did not.
+ *
+ * So the failure only appeared when a rule actually fired, on a cache hit:
+ * 2,116 dead-lettered AML evaluations, each retried five times, discovered
+ * only because the DeadLettersUnattended alert was pending. AML screening had
+ * effectively stopped and nothing else said so.
+ */
 const activeRules = async (): Promise<AmlRule[]> =>
-  cached(
+  cached<AmlRule[]>(
     'aml:rules:active',
     async () => prisma.amlRule.findMany({ where: { isActive: true }, orderBy: { code: 'asc' } }),
-    { ttlSeconds: RULE_CACHE_TTL },
+    {
+      ttlSeconds: RULE_CACHE_TTL,
+      revive: (raw) =>
+        (raw as AmlRule[]).map((rule) => ({
+          ...rule,
+          threshold: new Prisma.Decimal(rule.threshold as unknown as string),
+          createdAt: new Date(rule.createdAt),
+          updatedAt: new Date(rule.updatedAt),
+        })),
+    },
   );
 
 interface WindowAggregate {
