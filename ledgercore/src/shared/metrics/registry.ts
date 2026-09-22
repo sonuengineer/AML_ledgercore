@@ -158,6 +158,32 @@ export const cachePingDuration = new Histogram({
   registers: [registry],
 });
 
+/**
+ * Circuit breaker state for the cache: 0 CLOSED, 1 HALF_OPEN, 2 OPEN.
+ *
+ * Exists because Phase 16 measured a HUNG cache doing more damage than a dead
+ * one -- 58 rps against 142 -- while `cache_available` stayed at 1 the whole
+ * time and no alert fired. A breaker that trips without a metric is the same
+ * invisibility with extra steps.
+ */
+export const cacheCircuitState = new Gauge({
+  name: 'cache_circuit_state',
+  help: 'Cache circuit breaker: 0 closed, 1 half-open, 2 open',
+  registers: [registry],
+});
+
+/**
+ * Requests rejected by load shedding.
+ *
+ * The middleware was mounted in Phase 10 and exported nothing, so there was no
+ * way to answer "did we shed anything last night".
+ */
+export const httpRequestsShed = new Counter({
+  name: 'http_requests_shed_total',
+  help: 'Requests rejected by load shedding before reaching a handler',
+  registers: [registry],
+});
+
 export const cacheAvailable = new Gauge({
   name: 'cache_available',
   help: '1 when the cache is connected, 0 when degraded to the database',

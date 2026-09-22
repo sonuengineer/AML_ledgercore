@@ -1,7 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { TooManyRequestsError } from '../shared/errors/AppError';
 import { moduleLogger } from '../shared/logging/logger';
-import { httpRequestsInFlight } from '../shared/metrics/registry';
+import { httpRequestsInFlight, httpRequestsShed } from '../shared/metrics/registry';
 
 const log = moduleLogger('load-shedding');
 
@@ -69,6 +69,12 @@ export const loadShedding = (options: LoadSheddingOptions): RequestHandler => {
 
     if (inFlight >= options.maxInFlight) {
       shedTotal += 1;
+      // The process-local counter above dies with the process and is visible
+      // to nobody. Phase 16 found load shedding mounted since Phase 10 with no
+      // metric at all -- there was no way to answer 'did we shed anything last
+      // night'. A protection you cannot observe is a protection you cannot
+      // tune, and cannot prove fired.
+      httpRequestsShed.inc();
 
       // Log at most once a second. A shedding event by definition happens
       // thousands of times a second, and logging each one turns a capacity

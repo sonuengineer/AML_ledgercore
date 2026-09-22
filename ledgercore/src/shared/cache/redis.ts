@@ -1,7 +1,8 @@
 import Redis, { type RedisOptions } from 'ioredis';
 import { config } from '../../config';
 import { moduleLogger } from '../logging/logger';
-import { cacheAvailable, cachePingDuration } from '../metrics/registry';
+import { cacheAvailable, cacheCircuitState, cachePingDuration } from '../metrics/registry';
+import { CircuitBreaker, CircuitOpenError } from '../resilience/circuitBreaker';
 
 const log = moduleLogger('redis');
 
@@ -107,6 +108,57 @@ export const disconnectCache = async (): Promise<void> => {
  * the channel. A transition from available to unavailable is logged once, by
  * the 'error' handler above.
  */
+/**
+ * Circuit breaker around the cache.
+ *
+ * WHY THIS EXISTS, measured in Phase 16:
+ *
+ *   healthy cache  571 rps  p50  27.7ms
+ *   cache STOPPED  142 rps  p50 112.5ms
+ *   cache HUNG      58 rps  p50 335.5ms    <- 2.4x WORSE than dead
+ *
+ * A dead Redis is cheap: ioredis marks the client unavailable and the guard
+ * above returns the fallback without a syscall. A HUNG Redis -- the container
+ * paused, the host swapping, a network black hole -- keeps its connections
+ * open and answers nothing, so every single request pays the full
+ * REDIS_COMMAND_TIMEOUT_MS before falling back. The system does four times
+ * more work to produce exactly the same answer.
+ *
+ * Worse, `cache_available` stayed at 1 throughout, so the CacheDegraded alert
+ * never fired. The system believed the cache was fine while it was the single
+ * most expensive thing happening.
+ *
+ * The breaker converts slow failure into fast failure: after
+ * `failureThreshold` consecutive timeouts it stops calling Redis at all,
+ * admits one probe after the cooldown, and closes again once that probe
+ * succeeds twice.
+ *
+ * NOTE this is the first place the CircuitBreaker class is actually used.
+ * Phase 10 built it with 13 unit tests and wired it to nothing -- a resilience
+ * control that existed only in its own tests, while the documents claimed it
+ * was protecting the system. Finding that was worth more than the breaker.
+ *
+ * Thresholds: 5 consecutive failures, because a single blip must not take the
+ * cache out; 5s cooldown, because a cache is cheap to retry and staying open
+ * too long throws away the hit ratio that pays for all of this.
+ */
+const cacheBreaker = new CircuitBreaker({
+  name: 'cache',
+  failureThreshold: 5,
+  cooldownMs: 5_000,
+  successThreshold: 2,
+});
+
+const publishCircuitState = (): void => {
+  const state = cacheBreaker.snapshot().state;
+  cacheCircuitState.set(state === 'OPEN' ? 2 : state === 'HALF_OPEN' ? 1 : 0);
+  // The alert keys off cache_available, so an OPEN circuit has to show there
+  // too. Otherwise the hung case stays invisible, which is the bug this whole
+  // block exists to fix.
+  if (state === 'OPEN') cacheAvailable.set(0);
+  else if (available) cacheAvailable.set(1);
+};
+
 export const safely = async <T>(
   operation: (redis: Redis) => Promise<T>,
   fallback: T,
@@ -115,12 +167,23 @@ export const safely = async <T>(
   if (!client || !available) return fallback;
 
   try {
-    return await operation(client);
+    const result = await cacheBreaker.execute(async () => operation(client!));
+    publishCircuitState();
+    return result;
   } catch (error) {
+    publishCircuitState();
+
+    // An open circuit is the DESIGNED state, not an incident. Logging it per
+    // request would produce exactly the log flood the breaker exists to stop.
+    if (error instanceof CircuitOpenError) return fallback;
+
     log.warn({ context, err: error instanceof Error ? error.message : error }, 'cache operation failed');
     return fallback;
   }
 };
+
+/** For /health and tests. */
+export const cacheCircuit = (): ReturnType<CircuitBreaker['snapshot']> => cacheBreaker.snapshot();
 
 /** For /health. Returns latency in ms, or null when unavailable. */
 export const pingCache = async (): Promise<number | null> => {
