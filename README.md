@@ -73,6 +73,10 @@ the failure, the measurement and the fix.
   load produced **15,348 errors**, the same three nodes rolled one at a time
   produced **0**. Canary and blue-green cutover/rollback measured too
   ([PHASE13_CICD.md](PHASE13_CICD.md)).
+- **6.1x throughput** from two changes a profiler found and no metric showed:
+  `createPublicKey` was 25.5% of CPU on an HS256-only code path, and the
+  per-request user read was the rest. 173 -> 1,064 rps, p99 309 -> 123ms
+  ([PHASE14_PERFORMANCE.md](PHASE14_PERFORMANCE.md)).
 
 ---
 
