@@ -1,0 +1,1053 @@
+// LedgerCore -- Phase 3 schema subset.
+//
+// Scope note: this phase models ONLY what the foundation needs to prove the
+// layering end to end: organisation (bank / branch / business date) and
+// identity (user / role / permission). The ledger itself -- product, account,
+// account_balance, voucher, voucher_line, authorization_step, outbox -- is
+// designed and built in Phase 5.
+//
+// Conventions, all of them reactions to defects found in the legacy schema
+// (see PHASE0_DOMAIN_ANALYSIS.md section A8.3):
+//   * snake_case physical names, readable. Legacy used D009040 / DbtrAddMk.
+//   * real foreign keys. Legacy had zero.
+//   * nullable means unknown. Legacy used 0 and 1900-01-01 as sentinels.
+//   * VarChar, never Char. Legacy space-padded everything.
+//   * timestamptz, never naive local time.
+//   * every mutable row carries `version` for optimistic concurrency
+//     (the legacy DbtrUpdtChkId, done properly).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Organisation
+// ---------------------------------------------------------------------------
+
+model Bank {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String   @unique @db.VarChar(8)
+  name         String   @db.VarChar(120)
+  baseCurrency String   @map("base_currency") @db.VarChar(3)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  branches Branch[]
+
+  @@map("bank")
+}
+
+enum BranchStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+
+  @@map("branch_status")
+}
+
+model Branch {
+  id       String       @id @default(uuid()) @db.Uuid
+  bankId   String       @map("bank_id") @db.Uuid
+  /// Legacy LBrCode. Kept as a human-facing number because every branch user
+  /// knows their branch by it, but it is NOT the primary key any more.
+  code     Int
+  name     String       @db.VarChar(120)
+  status   BranchStatus @default(ACTIVE)
+  openedOn DateTime     @map("opened_on") @db.Date
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  bank                  Bank                  @relation(fields: [bankId], references: [id], onDelete: Restrict)
+  businessDates         BusinessDate[]
+  users                 User[]
+  customers             Customer[]
+  products              Product[]
+  accounts              Account[]
+  batches               Batch[]
+  vouchers              Voucher[]
+  authorizationPolicies AuthorizationPolicy[]
+  AmlAlert              AmlAlert[]
+
+  @@unique([bankId, code])
+  @@index([bankId, status])
+  @@map("branch")
+}
+
+enum DayStatus {
+  /// Created by the calendar, not yet opened by the branch.
+  PENDING
+  /// Day begin done. Postings allowed.
+  OPEN
+  /// Day end running. No new postings accepted.
+  CLOSING
+  /// Day end complete. Immutable.
+  CLOSED
+
+  @@map("day_status")
+}
+
+/// The branch's business date. Deliberately a table and not `new Date()`:
+/// value dating must not depend on which node served the request, and a
+/// branch can legitimately be running behind the wall clock.
+model BusinessDate {
+  id          String    @id @default(uuid()) @db.Uuid
+  branchId    String    @map("branch_id") @db.Uuid
+  workingDate DateTime  @map("working_date") @db.Date
+  status      DayStatus @default(PENDING)
+
+  openedAt   DateTime? @map("opened_at") @db.Timestamptz(6)
+  openedById String?   @map("opened_by_id") @db.Uuid
+  closedAt   DateTime? @map("closed_at") @db.Timestamptz(6)
+  closedById String?   @map("closed_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  branch   Branch  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  batches  Batch[]
+  openedBy User?   @relation("BusinessDateOpenedBy", fields: [openedById], references: [id], onDelete: Restrict)
+  closedBy User?   @relation("BusinessDateClosedBy", fields: [closedById], references: [id], onDelete: Restrict)
+
+  @@unique([branchId, workingDate])
+  @@index([branchId, status])
+  @@map("business_date")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// Replaces the legacy `Setup/Fin_{GroupId}.mnu` files on disk.
+/// Same idea (a user belongs to one group), but stored in the database so
+/// every node agrees and a change takes effect without a deploy.
+model Role {
+  id          String  @id @default(uuid()) @db.Uuid
+  code        String  @unique @db.VarChar(40)
+  name        String  @db.VarChar(80)
+  description String? @db.VarChar(255)
+  /// Legacy GrpCd, kept only so existing bank documentation still maps.
+  legacyGroup Int?    @map("legacy_group")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  permissions RolePermission[]
+  users       User[]
+
+  @@map("role")
+}
+
+/// `resource:action`, e.g. `voucher:create`, `voucher:authorize`, `branch:read`.
+/// The legacy five verbs (Add/Modify/Delete/Inquire/Authorize) map onto
+/// create/update/delete/read/authorize.
+model Permission {
+  id          String  @id @default(uuid()) @db.Uuid
+  code        String  @unique @db.VarChar(60)
+  description String? @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  roles RolePermission[]
+
+  @@map("permission")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  grantedAt DateTime @default(now()) @map("granted_at") @db.Timestamptz(6)
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permission")
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+  /// Locked by failed-login policy. Distinct from DISABLED (an admin action).
+  LOCKED
+
+  @@map("user_status")
+}
+
+model User {
+  id          String     @id @default(uuid()) @db.Uuid
+  /// Legacy UsrCode1. The login identifier.
+  staffCode   String     @unique @map("staff_code") @db.VarChar(16)
+  displayName String     @map("display_name") @db.VarChar(80)
+  email       String?    @unique @db.VarChar(160)
+  status      UserStatus @default(ACTIVE)
+
+  homeBranchId      String  @map("home_branch_id") @db.Uuid
+  roleId            String  @map("role_id") @db.Uuid
+  /// Legacy MultiBrAccess. Can this user act on branches other than home?
+  multiBranchAccess Boolean @default(false) @map("multi_branch_access")
+
+  /// The hash only. Never the password, never a reversible form.
+  /// Legacy stored it in D002002.Password CHAR(16), which cannot hold a hash.
+  passwordHash       String   @map("password_hash") @db.VarChar(255)
+  /// Which KDF produced passwordHash, so the algorithm can be migrated
+  /// per-user on next successful login without a flag day.
+  passwordAlgo       String   @default("scrypt") @map("password_algo") @db.VarChar(20)
+  passwordChangedAt  DateTime @default(now()) @map("password_changed_at") @db.Timestamptz(6)
+  mustChangePassword Boolean  @default(false) @map("must_change_password")
+
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt      DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  homeBranch Branch @relation(fields: [homeBranchId], references: [id], onDelete: Restrict)
+  role       Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  openedBusinessDates BusinessDate[]      @relation("BusinessDateOpenedBy")
+  closedBusinessDates BusinessDate[]      @relation("BusinessDateClosedBy")
+  refreshTokens       RefreshToken[]
+  madeVouchers        Voucher[]           @relation("VoucherMaker")
+  authorizationSteps  AuthorizationStep[]
+  idempotencyKeys     IdempotencyKey[]
+  auditEvents         AuditEvent[]
+  assignedAmlAlerts   AmlAlert[]
+
+  @@index([homeBranchId, status])
+  @@index([roleId])
+  // Keyset pagination for GET /users walks this index.
+  @@index([createdAt, id])
+  @@map("user")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 -- refresh tokens
+// ---------------------------------------------------------------------------
+
+enum RevokeReason {
+  /// Normal rotation: this token was exchanged for a successor.
+  ROTATED
+  /// The user logged out of this session.
+  LOGOUT
+  /// The user logged out of every session.
+  LOGOUT_ALL
+  /// An already-used token was presented again. The whole family is burned.
+  REUSE_DETECTED
+  /// Password changed -- every existing session is invalidated.
+  PASSWORD_CHANGED
+  /// An administrator revoked it.
+  ADMIN_REVOKED
+
+  @@map("revoke_reason")
+}
+
+/// A refresh token, one row per issued token.
+///
+/// Rotation means a successful refresh issues a NEW row and marks the old one
+/// used. The chain of rows sharing a `familyId` is one login session.
+///
+/// The legacy system's "refresh token" was simply a second JWT from the same
+/// secret with a longer expiry -- no store, no jti, no revocation. Logging out
+/// was `window.location.reload()`, which invalidated nothing.
+model RefreshToken {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// All tokens descended from one login share this. Reuse detection revokes
+  /// the family, not just the token -- see refreshToken.service.ts.
+  familyId String @map("family_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  /// SHA-256 of the token, hex. The plaintext is never stored, so a database
+  /// leak does not hand out usable sessions. A fast hash is correct here:
+  /// the token is 256 bits of CSPRNG output, so there is no guessable input
+  /// for a slow KDF to protect. Passwords are the opposite case.
+  tokenHash String @unique @map("token_hash") @db.VarChar(64)
+
+  issuedAt  DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  /// Set the moment this token is exchanged. A second presentation after this
+  /// is set is, by definition, a replay.
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+
+  revokedAt     DateTime?     @map("revoked_at") @db.Timestamptz(6)
+  revokedReason RevokeReason? @map("revoked_reason")
+  /// The successor issued when this one was rotated. Makes the chain walkable
+  /// during an incident review.
+  replacedById  String?       @unique @map("replaced_by_id") @db.Uuid
+
+  /// Context captured for the session list and for incident forensics.
+  createdByIp String? @map("created_by_ip") @db.VarChar(45)
+  userAgent   String? @map("user_agent") @db.VarChar(255)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Revoking a family is the hot path during an incident.
+  @@index([familyId])
+  // "Sessions for this user" and "revoke everything for this user".
+  @@index([userId, revokedAt])
+  // The cleanup job in Phase 7 deletes expired rows by this.
+  @@index([expiresAt])
+  @@map("refresh_token")
+}
+
+// ===========================================================================
+// Phase 5 -- the ledger
+// ===========================================================================
+//
+// Thirteen tables. The legacy CBS has 1486; this is the money path distilled
+// to what actually carries the invariants, with the names readable.
+//
+// Money is NUMERIC(19,4) everywhere. Never float. See shared/money.
+// ===========================================================================
+
+enum FreezeType {
+  NONE
+  /// Debits blocked, credits allowed. The common case: court order, KYC lapse.
+  DEBIT_BLOCKED
+  /// Nothing moves.
+  TOTAL
+
+  @@map("freeze_type")
+}
+
+/// Legacy D009011. CustNo becomes a uuid; the human-facing number stays.
+model Customer {
+  id             String @id @default(uuid()) @db.Uuid
+  /// Legacy CustNo -- what staff and customers actually quote.
+  customerNumber Int    @unique @map("customer_number")
+
+  fullName     String    @map("full_name") @db.VarChar(120)
+  /// Legacy IndOth.
+  isIndividual Boolean   @default(true) @map("is_individual")
+  dateOfBirth  DateTime? @map("date_of_birth") @db.Date
+  panNumber    String?   @map("pan_number") @db.VarChar(10)
+  phone        String?   @db.VarChar(20)
+  email        String?   @db.VarChar(160)
+
+  /// Home branch. Legacy LBrCode.
+  homeBranchId String @map("home_branch_id") @db.Uuid
+
+  /// Legacy MainCustNo -- related-party / group linking, used by AML in Phase 7.
+  groupCustomerId String? @map("group_customer_id") @db.Uuid
+
+  freezeType   FreezeType @default(NONE) @map("freeze_type")
+  freezeReason String?    @map("freeze_reason") @db.VarChar(120)
+
+  /// Legacy TdsYN / Form 15G-H. Drives tax on deposit interest.
+  taxExempt Boolean @default(false) @map("tax_exempt")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  homeBranch    Branch     @relation(fields: [homeBranchId], references: [id], onDelete: Restrict)
+  groupCustomer Customer?  @relation("CustomerGroup", fields: [groupCustomerId], references: [id], onDelete: Restrict)
+  groupMembers  Customer[] @relation("CustomerGroup")
+  accounts      Account[]
+  amlAlerts     AmlAlert[]
+
+  @@index([homeBranchId])
+  @@index([groupCustomerId])
+  // Customer search by name. A plain btree cannot serve ILIKE '%nair%'; the
+  // pg_trgm GIN index for that is added in the hand-written migration,
+  // because Prisma cannot express one.
+  @@index([phone])
+  @@map("customer")
+}
+
+enum ProductKind {
+  /// Savings: interest bearing, minimum balance, no overdraft.
+  SAVINGS
+  /// Current / overdraft: may go negative up to a sanctioned limit.
+  CURRENT_OD
+  /// Term loan: disbursed once, repaid on a schedule.
+  TERM_LOAN
+
+  @@map("product_kind")
+}
+
+/// Which side of the balance sheet an account sits on. Determines whether a
+/// debit increases or decreases the balance -- the single most common source
+/// of sign errors in a ledger.
+enum BalanceSide {
+  /// Loans, cash. Debit increases.
+  ASSET
+  /// Deposits. Credit increases.
+  LIABILITY
+
+  @@map("balance_side")
+}
+
+/// Legacy D009021. Per branch, because the same product can have different
+/// parameters at different branches.
+model Product {
+  id       String @id @default(uuid()) @db.Uuid
+  branchId String @map("branch_id") @db.Uuid
+  /// Legacy PrdCd.
+  code     String @db.VarChar(12)
+  name     String @db.VarChar(80)
+
+  kind        ProductKind
+  balanceSide BalanceSide @map("balance_side")
+  currency    String      @default("INR") @db.VarChar(3)
+
+  /// Legacy MinBal. Debits may not take the balance below this.
+  minimumBalance Decimal @default(0) @map("minimum_balance") @db.Decimal(19, 4)
+
+  /// Legacy CashDrTrnYN / TrfrCrTrnYN / ClrgDrTrnYN ... Which transaction
+  /// types are legal on this product at all. Checked on every line.
+  allowCashDebit      Boolean @default(true) @map("allow_cash_debit")
+  allowCashCredit     Boolean @default(true) @map("allow_cash_credit")
+  allowTransferDebit  Boolean @default(true) @map("allow_transfer_debit")
+  allowTransferCredit Boolean @default(true) @map("allow_transfer_credit")
+
+  /// The GL head this product's balances roll up into.
+  glAccountId String @map("gl_account_id") @db.Uuid
+
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  branch    Branch    @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  glAccount GlAccount @relation(fields: [glAccountId], references: [id], onDelete: Restrict)
+  accounts  Account[]
+
+  @@unique([branchId, code])
+  @@index([branchId, isActive])
+  @@map("product")
+}
+
+/// Chart of accounts. Deliberately shallow -- a real CBS has a deep tree, but
+/// depth adds no invariant that this project needs to demonstrate.
+model GlAccount {
+  id   String      @id @default(uuid()) @db.Uuid
+  code String      @unique @db.VarChar(12)
+  name String      @db.VarChar(80)
+  side BalanceSide
+
+  /// Cash, suspense and similar GL heads that vouchers post to directly
+  /// rather than through a customer account.
+  isPostable Boolean @default(false) @map("is_postable")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  products Product[]
+  accounts Account[]
+
+  @@map("gl_account")
+}
+
+enum AccountStatus {
+  ACTIVE
+  DORMANT
+  CLOSED
+
+  @@map("account_status")
+}
+
+/// Legacy D009022. The account master.
+///
+/// Note what is NOT here: balances. They live in account_balance, because this
+/// row is read constantly and almost never written, while the balance row is
+/// written on every posting. Splitting them keeps the hot-updated row narrow,
+/// which means less WAL per update and far less bloat for autovacuum to chase.
+model Account {
+  id            String @id @default(uuid()) @db.Uuid
+  /// Legacy PrdAcctId -- the number printed on the passbook.
+  accountNumber String @unique @map("account_number") @db.VarChar(24)
+
+  branchId    String  @map("branch_id") @db.Uuid
+  productId   String  @map("product_id") @db.Uuid
+  /// Null for GL/internal accounts (cash, suspense) that belong to no customer.
+  customerId  String? @map("customer_id") @db.Uuid
+  /// Set for internal accounts, so a voucher can post straight to a GL head.
+  glAccountId String? @map("gl_account_id") @db.Uuid
+
+  title    String        @db.VarChar(120)
+  status   AccountStatus @default(ACTIVE)
+  currency String        @default("INR") @db.VarChar(3)
+
+  freezeType   FreezeType @default(NONE) @map("freeze_type")
+  freezeReason String?    @map("freeze_reason") @db.VarChar(120)
+
+  /// Legacy D009042.TotSancLimit, flattened. A CURRENT_OD account may go
+  /// negative down to -overdraftLimit. Zero for everything else.
+  overdraftLimit Decimal @default(0) @map("overdraft_limit") @db.Decimal(19, 4)
+
+  openedOn DateTime  @map("opened_on") @db.Date
+  closedOn DateTime? @map("closed_on") @db.Date
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  branch    Branch          @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  customer  Customer?       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  glAccount GlAccount?      @relation(fields: [glAccountId], references: [id], onDelete: Restrict)
+  balance   AccountBalance?
+  lines     VoucherLine[]
+
+  @@index([branchId, status])
+  @@index([customerId])
+  @@index([productId])
+  @@map("account")
+}
+
+/// The hot row. One per account, updated on every posting that touches it.
+///
+/// The legacy D009022 carried all of this inline and in FLOAT. The
+/// cleared / ledger split is kept because it is real: money deposited by
+/// cheque counts toward the ledger balance but cannot be withdrawn until it
+/// clears.
+model AccountBalance {
+  accountId String @id @map("account_id") @db.Uuid
+
+  /// Legacy ActTotBal -- every posted entry, cleared or not.
+  ledgerBalance  Decimal @default(0) @map("ledger_balance") @db.Decimal(19, 4)
+  /// Legacy ActClrBal -- only cleared funds. Debits are checked against this.
+  clearedBalance Decimal @default(0) @map("cleared_balance") @db.Decimal(19, 4)
+  /// Legacy InClrgBal -- deposited, not yet cleared. ledger - cleared.
+  uncleared      Decimal @default(0) @db.Decimal(19, 4)
+  /// Legacy TotalLien -- court order, loan security.
+  lienAmount     Decimal @default(0) @map("lien_amount") @db.Decimal(19, 4)
+  /// Legacy ChgHoldAmt -- earmarked for pending charges.
+  holdAmount     Decimal @default(0) @map("hold_amount") @db.Decimal(19, 4)
+
+  lastPostedAt DateTime? @map("last_posted_at") @db.Timestamptz(6)
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Optimistic concurrency. The legacy DbtrUpdtChkId, done properly.
+  version   Int      @default(0)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("account_balance")
+}
+
+enum BatchStatus {
+  OPEN
+  CLOSED
+
+  @@map("batch_status")
+}
+
+/// Legacy GetBatchProperty. A voucher can only be posted into an OPEN batch on
+/// the branch's current business date.
+model Batch {
+  id             String      @id @default(uuid()) @db.Uuid
+  branchId       String      @map("branch_id") @db.Uuid
+  businessDateId String      @map("business_date_id") @db.Uuid
+  /// Legacy BatchCd: CASH, TRANSFER, CLEARING, SYSTEM.
+  code           String      @db.VarChar(12)
+  status         BatchStatus @default(OPEN)
+
+  openedAt DateTime  @default(now()) @map("opened_at") @db.Timestamptz(6)
+  closedAt DateTime? @map("closed_at") @db.Timestamptz(6)
+
+  /// Running control totals, so day-end can prove the batch balances without
+  /// scanning every line.
+  debitTotal   Decimal @default(0) @map("debit_total") @db.Decimal(19, 4)
+  creditTotal  Decimal @default(0) @map("credit_total") @db.Decimal(19, 4)
+  voucherCount Int     @default(0) @map("voucher_count")
+
+  version Int @default(0)
+
+  branch       Branch       @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  businessDate BusinessDate @relation(fields: [businessDateId], references: [id], onDelete: Restrict)
+  vouchers     Voucher[]
+
+  @@unique([businessDateId, code])
+  @@index([branchId, status])
+  @@map("batch")
+}
+
+enum TransactionType {
+  CASH
+  TRANSFER
+  CLEARING
+  /// Generated by a process (interest, charges, day-end), not by a teller.
+  SYSTEM
+
+  @@map("transaction_type")
+}
+
+enum VoucherStatus {
+  /// Created, waiting for one or more checkers.
+  PENDING_AUTH
+  /// Fully authorised and applied to balances. Terminal, except for reversal.
+  POSTED
+  /// A checker rejected it. Terminal.
+  REJECTED
+  /// A contra voucher has reversed it. Terminal.
+  REVERSED
+
+  @@map("voucher_status")
+}
+
+enum DrCr {
+  DEBIT
+  CREDIT
+
+  @@map("dr_cr")
+}
+
+/// The voucher: one balanced set of entries. Legacy D009040 grouped by SetNo.
+model Voucher {
+  id            String @id @default(uuid()) @db.Uuid
+  /// Human-facing, per branch per business date.
+  voucherNumber String @unique @map("voucher_number") @db.VarChar(32)
+
+  branchId String @map("branch_id") @db.Uuid
+  batchId  String @map("batch_id") @db.Uuid
+
+  transactionType TransactionType @map("transaction_type")
+  status          VoucherStatus   @default(PENDING_AUTH)
+
+  /// The legacy four dates, kept because they are genuinely four different
+  /// things.
+  ///   entryDate -- the branch business date it was keyed on
+  ///   postDate  -- the GL date it hits (equal to entryDate here; differs for
+  ///                back-value and future-dated work)
+  ///   valueDate -- the date interest is calculated from
+  entryDate DateTime @map("entry_date") @db.Date
+  postDate  DateTime @map("post_date") @db.Date
+  valueDate DateTime @map("value_date") @db.Date
+
+  /// Denormalised sum of the debit legs, in local currency. Equal to the
+  /// credit total by construction -- the balanced-voucher trigger checks it.
+  totalAmount Decimal @map("total_amount") @db.Decimal(19, 4)
+  currency    String  @default("INR") @db.VarChar(3)
+
+  narration        String    @db.VarChar(140)
+  /// Cheque / instrument reference, when there is one.
+  instrumentNumber String?   @map("instrument_number") @db.VarChar(20)
+  instrumentDate   DateTime? @map("instrument_date") @db.Date
+
+  /// Maker. A checker may never be this person.
+  makerId           String   @map("maker_id") @db.Uuid
+  makerAt           DateTime @default(now()) @map("maker_at") @db.Timestamptz(6)
+  /// How many distinct checkers this voucher needs, from the amount slab.
+  requiredApprovals Int      @map("required_approvals")
+
+  postedAt DateTime? @map("posted_at") @db.Timestamptz(6)
+
+  /// Reversal linkage. A correction is a new contra voucher, never a delete
+  /// and never an update -- legacy CanceledFlag / ReverseVoucher.
+  reversalOfId   String? @unique @map("reversal_of_id") @db.Uuid
+  reversalReason String? @map("reversal_reason") @db.VarChar(140)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  branch     Branch              @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  batch      Batch               @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  maker      User                @relation("VoucherMaker", fields: [makerId], references: [id], onDelete: Restrict)
+  reversalOf Voucher?            @relation("VoucherReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy Voucher?            @relation("VoucherReversal")
+  lines      VoucherLine[]
+  approvals  AuthorizationStep[]
+
+  // The authorisation queue is the single hottest screen in a branch. A
+  // PARTIAL index on status = 'PENDING_AUTH' is added in the hand-written
+  // migration -- pending rows are a tiny fraction of the table, so indexing
+  // only them keeps the index small enough to stay in cache.
+  @@index([branchId, status, createdAt])
+  // The unfiltered branch voucher list, newest first. Found missing by an
+  // EXPLAIN in Phase 5: without it the planner did a Seq Scan over 200k rows
+  // plus a 9.8 MB external merge sort to disk, because no existing index
+  // matched ORDER BY created_at DESC, id DESC. The composite index above does
+  // not help -- status is in its second position and this query does not
+  // filter on status.
+  @@index([branchId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([batchId])
+  @@index([makerId, createdAt])
+  @@map("voucher")
+}
+
+/// One leg of a voucher. Legacy D009040's ScrollNo.
+///
+/// This is the table that grows without bound, so it is RANGE PARTITIONED by
+/// post_date in the hand-written migration. Prisma cannot express partitioning
+/// but works fine against a partitioned table -- and the partition key must be
+/// part of the primary key, which is why the id here is composite.
+model VoucherLine {
+  id       String   @default(uuid()) @db.Uuid
+  /// Partition key. Duplicated from the parent voucher on purpose: a partition
+  /// key cannot be reached through a join.
+  postDate DateTime @map("post_date") @db.Date
+
+  voucherId  String @map("voucher_id") @db.Uuid
+  /// Position within the voucher, 1-based. Legacy ScrollNo.
+  lineNumber Int    @map("line_number")
+
+  accountId String  @map("account_id") @db.Uuid
+  drCr      DrCr    @map("dr_cr")
+  /// ALWAYS POSITIVE. Direction lives in drCr, never in the sign. A CHECK
+  /// constraint enforces it. Signed amounts plus a direction flag is how
+  /// ledgers end up double-negating.
+  amount    Decimal @db.Decimal(19, 4)
+
+  valueDate DateTime @map("value_date") @db.Date
+  narration String?  @db.VarChar(140)
+
+  /// Running balance after this line was applied. Denormalised so a statement
+  /// does not have to re-sum the account's entire history.
+  balanceAfter Decimal? @map("balance_after") @db.Decimal(19, 4)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  voucher Voucher @relation(fields: [voucherId], references: [id], onDelete: Cascade)
+  account Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@id([id, postDate])
+  // post_date is in the key because Postgres requires every UNIQUE constraint
+  // on a partitioned table to include the partition key. Harmless here: all
+  // lines of a voucher share its post_date by construction.
+  @@unique([voucherId, lineNumber, postDate])
+  // The statement query: one account, newest first, over a date range.
+  // post_date DESC matches the scan direction, so no sort node is needed.
+  @@index([accountId, postDate(sort: Desc), lineNumber])
+  @@index([voucherId])
+  @@map("voucher_line")
+}
+
+/// Amount slabs -> how many checkers. Legacy Checker1..Checker4 with
+/// NoAuthPending / NoAuthOver, expressed as data instead of four columns.
+model AuthorizationPolicy {
+  id       String  @id @default(uuid()) @db.Uuid
+  branchId String? @map("branch_id") @db.Uuid
+
+  transactionType TransactionType? @map("transaction_type")
+  /// Inclusive lower bound; the upper bound is the next slab.
+  minAmount       Decimal          @map("min_amount") @db.Decimal(19, 4)
+  maxAmount       Decimal?         @map("max_amount") @db.Decimal(19, 4)
+
+  /// 0 means the maker's own entry posts immediately (small cash, say).
+  requiredApprovals Int @map("required_approvals")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId, transactionType, minAmount])
+  @@map("authorization_policy")
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+
+  @@map("approval_decision")
+}
+
+/// One checker's decision. The legacy Checker1..Checker4 columns, normalised.
+model AuthorizationStep {
+  id        String @id @default(uuid()) @db.Uuid
+  voucherId String @map("voucher_id") @db.Uuid
+  /// 1-based. Unique per voucher, so the same level cannot be filled twice.
+  level     Int
+
+  actorId  String           @map("actor_id") @db.Uuid
+  decision ApprovalDecision
+  remarks  String?          @db.VarChar(140)
+
+  decidedAt DateTime @default(now()) @map("decided_at") @db.Timestamptz(6)
+
+  voucher Voucher @relation(fields: [voucherId], references: [id], onDelete: Cascade)
+  actor   User    @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@unique([voucherId, level])
+  // One person cannot approve the same voucher twice to satisfy two levels.
+  @@unique([voucherId, actorId])
+  @@index([actorId, decidedAt])
+  @@map("authorization_step")
+}
+
+/// Idempotency. A retried POST must not post twice.
+model IdempotencyKey {
+  key    String @id @db.VarChar(80)
+  userId String @map("user_id") @db.Uuid
+
+  /// SHA-256 of the request body. A client reusing a key with DIFFERENT
+  /// content is a bug on their side and must be told so, not silently served
+  /// the first response.
+  requestHash String @map("request_hash") @db.VarChar(64)
+
+  /// The original response, replayed verbatim on a retry.
+  ///
+  /// NULLABLE, because the row is inserted BEFORE the work runs.
+  ///
+  /// The first version stored the response only after success, which made the
+  /// whole mechanism a check-then-act race: five concurrent requests with the
+  /// same key all found no row, all proceeded, and all posted. A chaos test
+  /// caught it -- 5 vouchers from 5 concurrent retries, on the money path.
+  ///
+  /// Now the row is INSERTED first and the unique key on `key` is what makes
+  /// the claim atomic. A null response means "someone else is working on this
+  /// right now".
+  responseStatus Int?  @map("response_status")
+  responseBody   Json? @map("response_body")
+  /// Set when the response is recorded. Null means in flight.
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("idempotency_key")
+}
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+
+  @@map("outbox_status")
+}
+
+/// Transactional outbox.
+///
+/// The event is written in the SAME transaction as the state change, so the
+/// two commit or fail together. A relay publishes it afterwards. Publishing
+/// inside the transaction would announce things that then roll back;
+/// publishing after commit loses events when the process dies in between.
+/// There is no safe ordering of two separate systems -- this is the fix.
+model OutboxEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// e.g. voucher.posted, voucher.reversed.
+  eventType     String @map("event_type") @db.VarChar(60)
+  /// The entity this is about, for dedup and for tracing.
+  aggregateType String @map("aggregate_type") @db.VarChar(40)
+  aggregateId   String @map("aggregate_id") @db.Uuid
+
+  payload   Json
+  /// Copied from the request that caused it, so a worker's logs join the same
+  /// trace as the API call. This is why AsyncLocalStorage exists in Phase 3.
+  requestId String? @map("request_id") @db.VarChar(64)
+
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?      @map("last_error") @db.VarChar(500)
+  availableAt DateTime     @default(now()) @map("available_at") @db.Timestamptz(6)
+  sentAt      DateTime?    @map("sent_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  // The relay's query: pending, due, oldest first. A PARTIAL index on
+  // status = 'PENDING' is added in the hand-written migration -- once rows are
+  // SENT they are noise, and the relay polls this constantly.
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_event")
+}
+
+/// Append-only. Never updated, never deleted by the application.
+model AuditEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  actorId    String? @map("actor_id") @db.Uuid
+  action     String  @db.VarChar(60)
+  entityType String  @map("entity_type") @db.VarChar(40)
+  entityId   String  @map("entity_id") @db.Uuid
+
+  /// Before/after snapshots. jsonb so they can be queried during an audit.
+  before Json?
+  after  Json?
+
+  requestId  String?  @map("request_id") @db.VarChar(64)
+  ipAddress  String?  @map("ip_address") @db.VarChar(45)
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// Makes the audit consumer idempotent at the DATABASE level.
+  ///
+  /// The first version used a read-then-write existence check, which an
+  /// integration test proved racy: two redeliveries processed concurrently
+  /// both passed the check and both inserted. At-least-once delivery means
+  /// that is not a rare case, it is the expected one under load.
+  ///
+  /// A unique constraint makes the insert itself the check. Two genuinely
+  /// different events always differ in action or requestId, so this cannot
+  /// reject legitimate work.
+  @@unique([entityId, action, requestId])
+  @@index([entityType, entityId, occurredAt])
+  @@index([actorId, occurredAt])
+  @@map("audit_event")
+}
+
+// ===========================================================================
+// Phase 7 -- the AML slice
+// ===========================================================================
+//
+// The Direction-2 slice promised in Phase 1: posting events flow through the
+// queue into a rule worker that raises alerts. Three tables, not the legacy
+// FinAmlor product's dozen -- enough to demonstrate windowed aggregation,
+// idempotent consumption and a case workflow, and no more.
+//
+// Modelled on what Phase 0 found: TAmlRuleList, TAmlRuleresult, TAmlCtrparameter.
+// ===========================================================================
+
+enum AmlRuleKind {
+  /// Cash transactions above a threshold in a rolling window. The legacy
+  /// TAmlCtrparameter: India's CTR reporting threshold is 10 lakh.
+  CASH_THRESHOLD
+  /// Many small transactions that together exceed a threshold -- the classic
+  /// attempt to stay under a reporting limit.
+  STRUCTURING
+  /// A single transaction far outside this account's normal size.
+  VELOCITY
+
+  @@map("aml_rule_kind")
+}
+
+model AmlRule {
+  id   String      @id @default(uuid()) @db.Uuid
+  code String      @unique @db.VarChar(20)
+  name String      @db.VarChar(120)
+  kind AmlRuleKind
+
+  /// Rolling window the rule aggregates over.
+  windowDays Int     @map("window_days")
+  /// Trip point, in local currency.
+  threshold  Decimal @db.Decimal(19, 4)
+  /// STRUCTURING only: how many transactions must contribute.
+  minCount   Int?    @map("min_count")
+
+  isActive Boolean @default(true) @map("is_active")
+
+  /// Rules are VERSIONED and never edited in place.
+  ///
+  /// An alert has to be explainable months later: "which rule, at which
+  /// threshold, fired this?" If the row were mutable, changing a threshold
+  /// would silently rewrite the history of every alert it ever produced. A
+  /// change creates a new version and deactivates the old one; alerts pin the
+  /// version they were evaluated against.
+  version Int @default(1)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  alerts AmlAlert[]
+
+  @@index([isActive, kind])
+  @@map("aml_rule")
+}
+
+enum AlertStatus {
+  OPEN
+  /// An analyst is working it.
+  UNDER_REVIEW
+  /// Escalated for a Suspicious Transaction Report.
+  ESCALATED
+  /// Reviewed, no further action.
+  CLOSED_NO_ACTION
+  /// Sent back to the branch for more information. Legacy TAmlRevert.
+  REVERTED
+
+  @@map("alert_status")
+}
+
+model AmlAlert {
+  id String @id @default(uuid()) @db.Uuid
+
+  ruleId      String @map("rule_id") @db.Uuid
+  /// The rule version this was evaluated against. See AmlRule.version.
+  ruleVersion Int    @map("rule_version")
+
+  customerId String  @map("customer_id") @db.Uuid
+  accountId  String? @map("account_id") @db.Uuid
+  branchId   String  @map("branch_id") @db.Uuid
+
+  /// What tripped it: observed total, window, contributing transaction count,
+  /// and the voucher ids. jsonb so an analyst can query across alerts, and so
+  /// the evidence survives even if a rule is later retired.
+  evidence Json
+
+  /// The aggregate that crossed the threshold.
+  observedAmount Decimal  @map("observed_amount") @db.Decimal(19, 4)
+  windowFrom     DateTime @map("window_from") @db.Date
+  windowTo       DateTime @map("window_to") @db.Date
+
+  status       AlertStatus @default(OPEN)
+  assignedToId String?     @map("assigned_to_id") @db.Uuid
+  reviewNotes  String?     @map("review_notes") @db.VarChar(500)
+  reviewedAt   DateTime?   @map("reviewed_at") @db.Timestamptz(6)
+
+  /// Dedup key. Re-evaluating the same rule for the same customer and window
+  /// must not raise a second alert -- the queue is at-least-once, so the
+  /// consumer WILL see the same event twice. A unique index makes the
+  /// consumer idempotent at the database level rather than by hoping.
+  dedupeKey String @unique @map("dedupe_key") @db.VarChar(160)
+
+  /// The event that triggered evaluation, for tracing back to the posting.
+  triggeredByVoucherId String? @map("triggered_by_voucher_id") @db.Uuid
+  requestId            String? @map("request_id") @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  version   Int      @default(0)
+
+  rule       AmlRule  @relation(fields: [ruleId], references: [id], onDelete: Restrict)
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  branch     Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  assignedTo User?    @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  // The analyst queue: open alerts for a branch, newest first.
+  @@index([branchId, status, createdAt])
+  @@index([customerId, createdAt])
+  @@index([ruleId, createdAt])
+  @@map("aml_alert")
+}
+
+/// A job that exhausted its retries.
+///
+/// BullMQ keeps a failed set, but that lives in Redis and is therefore
+/// evictable, capped, and gone on a flush. A dead letter is evidence that work
+/// was lost -- it belongs in the database, where it can be queried, alerted on
+/// and replayed months later.
+model DeadLetter {
+  id String @id @default(uuid()) @db.Uuid
+
+  queueName String  @map("queue_name") @db.VarChar(60)
+  jobName   String  @map("job_name") @db.VarChar(60)
+  /// The queue's own job id, so a Redis-side entry can be correlated.
+  jobId     String? @map("job_id") @db.VarChar(80)
+
+  payload    Json
+  attempts   Int
+  lastError  String  @map("last_error") @db.VarChar(1000)
+  /// Kept in full: the stack is usually what actually explains the failure.
+  errorStack String? @map("error_stack") @db.Text
+
+  requestId String? @map("request_id") @db.VarChar(64)
+
+  /// Set when an operator replays it, so a replayed letter is not replayed twice.
+  replayedAt   DateTime? @map("replayed_at") @db.Timestamptz(6)
+  replayedById String?   @map("replayed_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([queueName, createdAt])
+  @@index([replayedAt])
+  @@map("dead_letter")
+}

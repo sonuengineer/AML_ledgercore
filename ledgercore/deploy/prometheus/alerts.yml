@@ -1,0 +1,189 @@
+groups:
+  # ===========================================================================
+  # Alert on SYMPTOMS, not causes.
+  #
+  # "Database CPU is 80%" is a cause and may be entirely fine. "p99 latency is
+  # 3 seconds" is a symptom and is never fine. Paging on causes trains people
+  # to ignore the channel, which is how a real incident gets missed.
+  #
+  # Every rule below states what to DO, because an alert that does not is just
+  # an interruption.
+  # ===========================================================================
+
+  - name: ledgercore-symptoms
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        # 5xx only. A 4xx is a client doing something wrong and is not an
+        # outage -- alerting on it means a scanner probing for /wp-admin pages
+        # somebody at 3am.
+        expr: |
+          sum(rate(http_request_duration_seconds_count{status_class="5xx"}[5m]))
+            /
+          sum(rate(http_request_duration_seconds_count[5m])) > 0.01
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Over 1% of requests are failing with 5xx"
+          runbook: "Check /health on each node, then the error log filtered to level=error. The requestId in each line traces the full request."
+
+      - alert: HighLatencyP99
+        # Phase 8 measured p99 at 390-810ms with three nodes under load, so 2s
+        # is comfortably above normal-but-busy and well below "users have given
+        # up". A threshold picked from measurement, not from a round number.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "p99 latency above 2s"
+          runbook: "Check event loop lag first (nodejs_eventloop_lag_seconds) -- if it is high the problem is CPU on the request path, not the database. Then db_query_duration_seconds, then cache_available."
+
+      - alert: EventLoopBlocked
+        # THE Node-specific signal. A blocked event loop does not raise CPU to
+        # 100% and does not show up as a slow query -- every request just
+        # waits. It is what distinguishes "the database is slow" from "we are
+        # doing something CPU-bound on the request path".
+        # Also per-node on purpose: a blocked event loop is a property of ONE
+        # process, and knowing which one is most of the diagnosis.
+        expr: nodejs_eventloop_lag_seconds > 0.5
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Event loop lag above 500ms on {{ $labels.instance }}"
+          runbook: "Something synchronous and expensive is on the request path. Take a CPU profile. Common causes: large JSON serialisation, a sync crypto call, an unbounded loop over a query result."
+
+      - alert: NoPostingsDuringBusinessHours
+        # The business metric, and the one most likely to catch an incident
+        # nobody predicted. Every infrastructure metric can look perfect while
+        # the bank has stopped working -- a wrong permission grant, a closed
+        # batch, a broken frontend deploy.
+        expr: sum(rate(vouchers_posted_total[15m])) == 0
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: "No vouchers posted in 15 minutes"
+          runbook: "Check vouchers_rejected_total by reason -- DAY_NOT_OPEN means day-begin was not run. If rejections are also zero, requests are not arriving: check the load balancer."
+
+  - name: ledgercore-async
+    interval: 30s
+    rules:
+      - alert: OutboxRelayStopped
+        # The single most important rule here, for a non-obvious reason: if the
+        # relay stops, the QUEUE IS EMPTY and every queue-depth dashboard goes
+        # green while events pile up in Postgres. Queue depth cannot detect a
+        # stopped producer. Only this can.
+        # `max(...)`, not the bare gauge.
+        #
+        # Every API node reports this, so the bare expression produces ONE
+        # ALERT PER INSTANCE for a condition that is global -- the outbox is a
+        # single shared table. Firing it produced three identical pages.
+        #
+        # The general rule: an alert on a global condition must aggregate away
+        # the instance label, or on-call gets paged once per replica.
+        expr: max(outbox_oldest_pending_seconds) > 300
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Oldest unpublished outbox event is over 5 minutes old"
+          runbook: "The relay has stopped or is failing. Check the worker process is alive and outbox_events_published_total{result='failed'}. Events are durable -- nothing is lost, but nothing downstream is happening either."
+
+      - alert: QueueBacklogGrowing
+        expr: sum by (queue) (queue_depth{state="waiting"}) > 1000
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.queue }} has over 1000 jobs waiting"
+          runbook: "Consumers cannot keep up. Scale workers (they scale on this signal, independently of the API). If depth keeps growing after scaling, a consumer is stuck -- check job_duration_seconds for that queue."
+
+      - alert: JobsDeadLettering
+        # Retries are normal; dead letters are work being LOST. Two different
+        # counters on purpose, because they deserve two different responses.
+        expr: sum(rate(jobs_processed_total{result="dead_lettered"}[15m])) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Jobs are reaching the dead-letter queue"
+          runbook: "Query dead_letter for last_error and error_stack. Fix the cause, then replay with replayDeadLetter -- it stamps replayed_at so it cannot be applied twice."
+
+      - alert: DeadLettersUnattended
+        # Aggregated for the same reason as OutboxRelayStopped: every node
+        # reports the same shared count.
+        expr: max(dead_letters_unreplayed) > 0
+        for: 24h
+        labels: { severity: ticket }
+        annotations:
+          summary: "Dead letters have been sitting unreplayed for 24 hours"
+          runbook: "A DLQ nobody drains is a log file with extra steps. Either replay them or record why they are being abandoned."
+
+  - name: ledgercore-dependencies
+    interval: 30s
+    rules:
+      - alert: CacheDegraded
+        # Ticket, NOT page. Phase 6 proved the API keeps working with Redis
+        # down -- slower, not broken. Paging for a degradation the system is
+        # designed to absorb is how alert fatigue starts.
+        # NOT aggregated, deliberately -- the opposite call to the two above.
+        # Cache connectivity is genuinely PER NODE: one node can lose Redis
+        # while the others are fine, and that is exactly what you want to see.
+        # `min()` here would hide a single degraded node behind two healthy
+        # ones.
+        expr: cache_available == 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Cache unavailable on {{ $labels.instance }}, serving from the database"
+          runbook: "The API is degraded but correct. Restart Redis. Watch p99 -- Phase 6 measured roughly a 3x increase on cached read paths."
+
+      - alert: DatabaseSlow
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(db_query_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Database p99 query time above 500ms"
+          runbook: "Check pg_stat_activity for long transactions and lock waits, then the slow-query warnings in the log (they carry model and operation). Check whether an unindexed query shipped recently."
+
+      - alert: ConnectionPoolExhausted
+        # Node's libuv threadpool queue is a proxy for pool saturation: when
+        # every connection is busy, requests queue here first.
+        expr: rate(nodejs_active_resources{type="TCPSocketWrap"}[5m]) > 0 and http_requests_in_flight > 100
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "High in-flight requests -- possible connection pool exhaustion"
+          runbook: "Three nodes at connection_limit=10 is 30 connections plus workers. Check Postgres max_connections. pgBouncer (Phase 11) is the fix, not raising the limit."
+
+  - name: ledgercore-security
+    interval: 30s
+    rules:
+      - alert: CredentialStuffingSuspected
+        expr: sum(rate(auth_failures_total{reason="unknown_user"}[5m])) * 60 > 30
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "High rate of logins against unknown staff codes"
+          runbook: "Someone is enumerating. The per-IP rate limit (Phase 6) should already be shedding this -- check http_errors_total{code='RATE_LIMITED'} to confirm it is engaging."
+
+      - alert: PasswordSprayingSuspected
+        # Distinct from the above: spraying uses VALID staff codes with one
+        # common password, so no single account reaches its lockout threshold.
+        # That is exactly the attack the per-account lockout cannot see.
+        expr: sum(rate(auth_failures_total{reason="bad_password"}[5m])) * 60 > 30
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "High rate of bad-password failures against valid accounts"
+          runbook: "Password spraying. Check the source IPs in the access log; the per-account lockout will not catch this on its own."
+
+      - alert: AmlAlertSpike
+        expr: sum(rate(aml_alerts_raised_total[1h])) * 3600 > 50
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "AML alerts being raised far above baseline"
+          runbook: "Either genuine activity or a rule mis-tuned after a change. Check aml_rule for a recent version bump before assuming the former."

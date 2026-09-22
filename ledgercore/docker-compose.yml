@@ -1,0 +1,399 @@
+# Local topology.
+#
+# Profiles exist so that the everyday developer loop does not change. A service
+# with a `profiles` key is skipped unless that profile is named, so:
+#
+#   docker compose up -d postgres        -> postgres only (what pnpm db:up does)
+#   docker compose --profile full up -d  -> postgres + api, api on ${API_HOST_PORT}
+#   docker compose --profile migrate run --rm migrate
+#                                        -> prisma migrate deploy, then exit
+#
+# The postgres service below is deliberately untouched: its volume already
+# holds an applied migration and seeded data, and changing the volume name,
+# credentials, database name or port mapping would silently orphan it.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledgercore-postgres
+    environment:
+      POSTGRES_USER: ledgercore
+      POSTGRES_PASSWORD: ledgercore
+      POSTGRES_DB: ledgercore
+    ports:
+      - "5432:5432"
+    volumes:
+      - ledgercore-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledgercore -d ledgercore"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Redis -- CACHE role.
+  #
+  # `allkeys-lru` and no persistence, on purpose: everything in here is
+  # reconstructible from Postgres, so evicting under memory pressure is the
+  # correct behaviour rather than a data loss.
+  #
+  # Phase 7 adds a SECOND Redis for the job queue with `noeviction` and AOF on.
+  # Running the queue on an LRU cache is a real trap -- jobs get evicted and
+  # simply vanish -- so the two roles never share an instance here.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ledgercore-redis
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Redis -- QUEUE role. A SEPARATE instance from the cache, deliberately.
+  #
+  # `noeviction` and AOF on, which are the exact opposite of the cache's
+  # settings. Running a job queue on an LRU cache is a real trap: under memory
+  # pressure Redis evicts keys, and the keys it evicts are jobs. Work simply
+  # vanishes, with no error anywhere.
+  #
+  # `noeviction` means Redis returns an error on write instead of silently
+  # dropping data -- a loud failure the producer can handle. AOF means a
+  # restart does not lose the queue.
+  # ---------------------------------------------------------------------------
+  redis-queue:
+    image: redis:7-alpine
+    container_name: ledgercore-redis-queue
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "6380:6379"
+    volumes:
+      - ledgercore-queuedata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    profiles: ["full"]
+    build:
+      context: .
+      target: runtime
+    image: ledgercore-api:local
+    container_name: ledgercore-api
+    depends_on:
+      postgres:
+        # Not `service_started`. Postgres accepts TCP several seconds before it
+        # accepts queries, and server.ts calls connectDatabase() before it
+        # listens -- so a started-but-not-ready Postgres makes the API exit 1
+        # at boot instead of waiting.
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      LOG_LEVEL: info
+      SHUTDOWN_TIMEOUT_MS: 15000
+      # `postgres`, not localhost: inside the compose network the service name
+      # is the hostname. localhost here would be the api container itself.
+      DATABASE_URL: postgresql://ledgercore:ledgercore@postgres:5432/ledgercore?schema=public&connection_limit=10&pool_timeout=10
+      DB_STATEMENT_TIMEOUT_MS: 5000
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-at-least-32-chars-long}
+      JWT_ISSUER: ledgercore
+      JWT_AUDIENCE: ledgercore-api
+      ACCESS_TOKEN_TTL_SECONDS: 900
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+      BODY_LIMIT: 256kb
+    ports:
+      # Host 4010 rather than 4000 so `pnpm dev` can keep 4000 and both can run
+      # at once. Container side stays 4000 to match PORT and the HEALTHCHECK.
+      - "${API_HOST_PORT:-4010}:4000"
+    # NODE_ENV=production sets DRAIN_DELAY_MS to 10s in server.ts, and the full
+    # sequence (drain + server.close + prisma disconnect) needs more than
+    # Docker's 10s default. At the default the daemon would SIGKILL mid-drain
+    # and the container would exit 137, which is precisely the ungraceful
+    # shutdown this sequence exists to avoid. 30s leaves headroom over
+    # SHUTDOWN_TIMEOUT_MS=15000, the app's own hard-exit guard.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Phase 8 -- horizontal scale.
+  #
+  #   docker compose --profile scale up -d
+  #
+  # Three API nodes behind nginx, plus a worker. Everything they need to share
+  # -- sessions, permissions, rate-limit counters, idempotency records, the
+  # outbox -- is in Postgres or Redis, never in a node's memory. That is what
+  # makes round robin correct and sticky sessions unnecessary.
+  #
+  # The three api-N blocks are identical apart from INSTANCE_ID, which is
+  # diagnostic only. If they ever need to differ in anything else, the API has
+  # stopped being stateless.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # pgBouncer. Part of the `scale` profile, because it only matters once there
+  # is more than one API node -- which is exactly when it starts to matter a
+  # lot. See deploy/pgbouncer/pgbouncer.ini for the full reasoning.
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    profiles: ["scale"]
+    image: edoburu/pgbouncer:v1.23.1-p2
+    container_name: ledgercore-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./deploy/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./deploy/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "${PGBOUNCER_HOST_PORT:-6432}:6432"
+    healthcheck:
+      # `pg_isready`, not `nc -z`.
+      #
+      # The first version used `nc -z localhost 6432`. pgBouncer was serving
+      # 143 queries/s perfectly happily, but busybox's `nc` does not support
+      # `-z`, so the check returned 1 and the container was marked unhealthy.
+      # Every api node then refused to start, because they wait on
+      # `condition: service_healthy`.
+      #
+      # A healthcheck that uses a binary the image does not have -- or a flag
+      # it does not support -- reports a healthy service as broken and takes
+      # down everything downstream. Worse than having no healthcheck at all.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api-1: &api-node
+    profiles: ["scale"]
+    build:
+      context: .
+      target: runtime
+    image: ledgercore-api:local
+    container_name: ledgercore-api-1
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    environment: &api-env
+      NODE_ENV: production
+      PORT: 4000
+      LOG_LEVEL: info
+      INSTANCE_ID: api-1
+      SHUTDOWN_TIMEOUT_MS: 15000
+      # Through pgBouncer, not straight to Postgres.
+      #
+      # `pgbouncer=true` is REQUIRED, not optional: it tells Prisma to stop
+      # using server-side prepared statements. Transaction pooling hands the
+      # next statement to a different backend, and a prepared statement
+      # created on one is not visible on another -- you get
+      # "prepared statement s0 already exists" intermittently under load.
+      DATABASE_URL: postgresql://ledgercore:ledgercore@pgbouncer:6432/ledgercore?schema=public&pgbouncer=true&connection_limit=10&pool_timeout=10
+      DB_STATEMENT_TIMEOUT_MS: 5000
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-at-least-32-chars-long}
+      JWT_ISSUER: ledgercore
+      JWT_AUDIENCE: ledgercore-api
+      ACCESS_TOKEN_TTL_SECONDS: 900
+      REFRESH_TOKEN_TTL_SECONDS: 604800
+      REFRESH_COOKIE_NAME: lc_rt
+      COOKIE_SECURE: "false"
+      # Service names, not localhost: inside the compose network localhost is
+      # the container itself.
+      REDIS_URL: redis://redis:6379
+      QUEUE_REDIS_URL: redis://redis-queue:6379
+      CACHE_ENABLED: "true"
+      RATE_LIMIT_ENABLED: "true"
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000,http://localhost:3002
+      BODY_LIMIT: 256kb
+      WORKER_METRICS_PORT: 9101
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  api-2:
+    <<: *api-node
+    container_name: ledgercore-api-2
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-2
+
+  api-3:
+    <<: *api-node
+    container_name: ledgercore-api-3
+    environment:
+      <<: *api-env
+      INSTANCE_ID: api-3
+
+  # ---------------------------------------------------------------------------
+  # The worker is a SEPARATE service from the API, not a replica of it.
+  #
+  # It scales on queue depth while the API scales on RPS and latency, and a
+  # deploy of one does not force a deploy of the other. Same image, different
+  # command -- the modular-monolith payoff from Phase 2.
+  #
+  # `healthcheck: disable` because it has no HTTP listener. Giving it the API's
+  # /readiness check would mark a perfectly healthy worker as unhealthy.
+  # ---------------------------------------------------------------------------
+  worker:
+    profiles: ["scale"]
+    build:
+      context: .
+      target: runtime
+    image: ledgercore-api:local
+    # NO container_name.
+    #
+    # A fixed container_name makes a service unscalable -- `--scale worker=3`
+    # fails with "Docker requires each container to have a unique name" and
+    # silently leaves you with one. Found the hard way while trying to prove
+    # that three relays share the outbox: the test ran with a single worker.
+    #
+    # The API nodes keep their names because they are three DISTINCT services
+    # (api-1/2/3) that nginx addresses by hostname. The worker is one service
+    # with N replicas, which is the shape anything autoscaled has to take --
+    # and is what ECS desired-count and a k8s Deployment both look like.
+    command: ["node", "dist/worker.js"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    environment:
+      <<: *api-env
+      INSTANCE_ID: worker-1
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Prometheus. Part of the `scale` profile so metrics are exercised against
+  # the real multi-node topology rather than a single container -- aggregating
+  # a histogram across three instances is the thing being demonstrated.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    profiles: ["scale"]
+    image: prom/prometheus:v2.54.1
+    container_name: ledgercore-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    ports:
+      - "${PROM_HOST_PORT:-9090}:9090"
+    restart: unless-stopped
+
+  nginx:
+    profiles: ["scale"]
+    image: nginx:1.27-alpine
+    container_name: ledgercore-nginx
+    depends_on:
+      - api-1
+      - api-2
+      - api-3
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${LB_HOST_PORT:-8080}:80"
+    healthcheck:
+      # `127.0.0.1`, not `localhost`. SECOND time a healthcheck lied about a
+      # service that was working fine (the first was pgBouncer's `nc -z`).
+      #
+      # busybox resolves `localhost` to ::1 first, and nginx here has only
+      # `listen 80;` -- IPv4. So wget got ECONNREFUSED on IPv6 and marked the
+      # container unhealthy while its own access log showed it proxying
+      # /api/v1/auth/me with status=200 to all three api nodes.
+      #
+      # Harmless only because `web` and the api nodes depend on nginx with a
+      # plain `depends_on`. Add `condition: service_healthy` anywhere and this
+      # becomes a stack-wide deadlock -- which is exactly what the pgBouncer
+      # version did. Always resolve healthchecks to an explicit address.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/lb-health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # The React frontend. Part of `scale` because it talks to the LB, not to a
+  # single api node -- which is the whole point of serving it next to nginx.
+  #
+  # Built from ../ledgercore-web: a SEPARATE image with no Node in it at all.
+  # Two artefacts, two lifecycles -- a CSS change should not rebuild, re-scan
+  # and redeploy the ledger.
+  #
+  # API_BASE_URL is read by the BROWSER, so it must be an address the browser
+  # can reach. `http://nginx/api/v1` would resolve only inside this network and
+  # every request from the page would fail. Hence the host-visible LB port.
+  # ---------------------------------------------------------------------------
+  web:
+    profiles: ["scale"]
+    build:
+      context: ../ledgercore-web
+    image: ledgercore-web:local
+    container_name: ledgercore-web
+    depends_on:
+      - nginx
+    environment:
+      # Must match an entry in the api nodes' CORS_ORIGINS, or the browser
+      # blocks every response even though the API answered 200.
+      API_BASE_URL: http://localhost:${LB_HOST_PORT:-8080}/api/v1
+      APP_ENV: local
+    ports:
+      # 3002. 3000 was taken outright; 3001 was worse -- it BOUND fine and
+      # still served the wrong app.
+      #
+      # Docker binds 0.0.0.0:3001 AND [::]:3001. A stray legacy Vite dev server
+      # was already on [::1]:3001, and a specific bind beats a wildcard, so
+      # `http://localhost:3001` (which resolves ::1 first) reached the OLD app
+      # while `http://127.0.0.1:3001` reached this container. A free-port check
+      # done over /dev/tcp tests IPv4 only, so it reported 3001 as free.
+      #
+      # Same root cause as the nginx healthcheck above: on a dual-stack host
+      # `localhost` is two addresses, and assuming it is one is how you debug
+      # the wrong process for ten minutes.
+      - "${WEB_HOST_PORT:-3002}:8080"
+    restart: unless-stopped
+
+  # One-shot. `run --rm migrate` rather than `up`: this must exit, and its exit
+  # code is the answer to "did the migration apply".
+  #
+  # It uses the `build` stage, not `runtime`: migrate deploy needs the Prisma
+  # CLI (a devDependency) and prisma/migrations/, and neither belongs in the
+  # production image.
+  migrate:
+    profiles: ["migrate"]
+    build:
+      context: .
+      target: build
+    image: ledgercore-migrate:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://ledgercore:ledgercore@postgres:5432/ledgercore?schema=public
+    command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
+    restart: "no"
+
+volumes:
+  ledgercore-queuedata:
+  ledgercore-pgdata:

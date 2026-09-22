@@ -1,0 +1,46 @@
+# =============================================================================
+# ALLOWLIST, not a denylist -- and that is deliberate.
+#
+# This directory is not a clean project root. It also holds the LEGACY .NET
+# backend and React frontends (Backend/, CoreLibraries/, DataModel/,
+# FinCoreMainNew/, Frontend/, Fin_Connect_Cms_React/, ib-admin-portal-ui/,
+# New_fin/, AML-*/). That code is reference material for understanding the
+# business domain. It is proprietary and this repository is PUBLIC, so it must
+# never be committed.
+#
+# A denylist ("ignore node_modules, ignore .env") fails open: anything nobody
+# thought of gets committed. An allowlist fails closed: anything nobody thought
+# of is ignored. For a public repo sharing a parent directory with proprietary
+# source, fail-closed is the only defensible choice.
+#
+# Verify with `git ls-files` before every first push, not with hope.
+# =============================================================================
+
+# Ignore every top-level entry ...
+/*
+
+# ... then re-admit only what belongs to THIS project.
+!/.gitignore
+!/.github/
+!/ledgercore/
+!/ledgercore-web/
+!/README.md
+
+# Phase write-ups for the NEW system.
+!/PHASE2_ARCHITECTURE.md
+!/PHASE3_BACKEND_FOUNDATION.md
+!/PHASE4_AUTHENTICATION.md
+!/PHASE5_LEDGER.md
+!/PHASE6_REDIS.md
+!/PHASE7_ASYNC.md
+!/PHASE8_LOAD_BALANCING.md
+!/PHASE9_OBSERVABILITY.md
+!/PHASE10_FAILURE_HANDLING.md
+!/PHASE11_AWS.md
+!/PHASE12_DOCKER.md
+
+# NOT re-admitted, pending an explicit decision (see README):
+#   PHASE0_DOMAIN_ANALYSIS.md  -- analyses the legacy system
+#   ARCHITECTURE.md            -- pre-existing, describes the legacy system
+#   dbmigaratiom.md            -- pre-existing legacy notes
+#   prompt.md                  -- personal brief, not project code

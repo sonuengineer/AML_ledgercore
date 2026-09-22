@@ -1,0 +1,417 @@
+name: CI
+
+# -----------------------------------------------------------------------------
+# WHY THIS FILE LIVES AT THE REPOSITORY ROOT
+#
+# The first version of this workflow sat at `ledgercore/.github/workflows/ci.yml`
+# and was never going to run. GitHub Actions reads workflows from
+# `<repo-root>/.github/workflows/` ONLY -- a `.github` directory inside a
+# subdirectory is just a folder. The file had been reviewed, committed and
+# believed in; it had simply never been executed, so nothing said otherwise.
+#
+# That is the whole argument for CI: a pipeline you have not watched run is a
+# document, not a guarantee.
+#
+# Because the repo holds two projects, every job sets its own
+# `working-directory` and `paths` filter.
+#
+# STRUCTURE
+#
+#   api-typecheck -> api-test -> api-build -> api-integration -> api-docker
+#   web-build -----------------------------------------------> web-docker
+#
+# The two chains run in PARALLEL and neither `needs` the other. That is the
+# Phase 12 decision made executable: two artefacts, two lifecycles. A CSS change
+# must not wait on ledger integration tests, and a ledger change must not be
+# blocked by a frontend type error.
+#
+# Within the API chain the jobs are SERIAL, deliberately. The cheapest and most
+# specific failure should be the one a developer sees first: a type error must
+# be reported as "typecheck failed" in 40 seconds, not as "integration tests
+# failed" eight minutes later behind a Postgres that had to boot. The cost is a
+# slower green run. Worth it, because the run you are reading is almost always
+# a red one.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A force-push should not leave the previous run burning service containers.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege. The default token is read/write on contents unless the repo
+# says otherwise; nothing here writes to the repo.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
+
+jobs:
+  # ===========================================================================
+  # API chain
+  # ===========================================================================
+  api-typecheck:
+    name: api / typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ledgercore
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # setup-node must come AFTER action-setup: `cache: pnpm` resolves the
+      # store path by running pnpm, which has to exist by then.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          # Required in a monorepo -- without it the cache key is computed from
+          # a lockfile at the repo root, which does not exist here.
+          cache-dependency-path: ledgercore/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      # tsconfig.json includes prisma/ and tests/, both of which import
+      # @prisma/client types. Without generate, typecheck fails on a module that
+      # has simply not been written to disk yet.
+      - run: pnpm db:generate
+
+      - run: pnpm typecheck
+
+  api-test:
+    name: api / unit tests
+    runs-on: ubuntu-latest
+    needs: api-typecheck
+    defaults:
+      run:
+        working-directory: ledgercore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ledgercore/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+
+      # vitest.config.ts excludes *.int.test.ts, so this job needs no services.
+      - run: pnpm test
+
+  api-build:
+    name: api / build
+    runs-on: ubuntu-latest
+    needs: api-test
+    defaults:
+      run:
+        working-directory: ledgercore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ledgercore/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+      - run: pnpm build
+
+      # Not something to deploy from -- the Docker image compiles its own dist.
+      # This exists for a human diffing "what actually got emitted" when a build
+      # behaves differently in CI than on a laptop.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-dist
+          path: ledgercore/dist
+          retention-days: 7
+
+  api-integration:
+    name: api / integration tests
+    runs-on: ubuntu-latest
+    needs: api-build
+    defaults:
+      run:
+        working-directory: ledgercore
+
+    # THREE services, not one.
+    #
+    # The previous version of this file declared only Postgres. cache.int.test.ts
+    # and queue.int.test.ts would both have failed on connection refused -- a
+    # second latent bug that only a real run would ever have surfaced.
+    #
+    # Note what CI canNOT reproduce: service containers take `options` but not a
+    # `command`, so these Redises run with stock config. Production splits them
+    # precisely on config (cache = allkeys-lru + no persistence, queue =
+    # noeviction + AOF). The split is asserted here by ROLE and by URL, not by
+    # eviction behaviour. Testing "does the queue survive memory pressure"
+    # requires the compose topology, not a CI service container.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ledgercore
+          POSTGRES_PASSWORD: ledgercore
+          POSTGRES_DB: ledgercore
+        ports:
+          - 5432:5432
+        # Without this, steps start against a Postgres that is listening but not
+        # yet accepting queries, and `migrate deploy` fails intermittently --
+        # the worst kind of CI failure, because it passes on re-run.
+        options: >-
+          --health-cmd "pg_isready -U ledgercore -d ledgercore"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      redis-queue:
+        image: redis:7-alpine
+        # Host 6380 -> container 6379, exactly as docker-compose maps it, so
+        # QUEUE_REDIS_URL is the same string developers already use.
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      # Service containers are published on the runner's localhost.
+      DATABASE_URL: postgresql://ledgercore:ledgercore@localhost:5432/ledgercore?schema=public&connection_limit=10&pool_timeout=10
+      REDIS_URL: redis://localhost:6379
+      QUEUE_REDIS_URL: redis://localhost:6380
+      NODE_ENV: test
+      LOG_LEVEL: error
+      # A CI-only value. Config validation requires >= 32 chars, so a short
+      # placeholder would fail at boot rather than at assertion time.
+      JWT_SECRET: ci-only-secret-change-me-at-least-32-chars-long
+      JWT_ISSUER: ledgercore
+      JWT_AUDIENCE: ledgercore-api
+      CACHE_ENABLED: "true"
+      RATE_LIMIT_ENABLED: "true"
+      QUEUE_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ledgercore/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+
+      # `migrate deploy`, never `migrate dev`. Deploy applies committed
+      # migrations and nothing else. `dev` would happily invent a new migration
+      # from a drifted schema and commit CI to a state no developer has.
+      #
+      # This step is also the schema-drift gate: if someone edits schema.prisma
+      # without generating a migration, deploy produces a database that
+      # schema.int.test.ts then fails against. That test exists because
+      # `prisma migrate diff` once silently dropped two hand-written trigram
+      # indexes, and nothing noticed for two phases.
+      - name: Apply migrations
+        run: pnpm db:deploy
+
+      - name: Seed
+        run: pnpm db:seed
+
+      - name: Integration tests
+        run: pnpm test:int
+
+  api-docker:
+    name: api / docker build
+    runs-on: ubuntu-latest
+    needs: api-integration
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ledgercore
+          target: runtime
+          push: false
+          load: true
+          tags: ledgercore-api:${{ github.sha }}
+          # Buildx on a fresh runner has no layer cache; without this the pnpm
+          # install stage is re-run from scratch on every single push.
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      # Proves the image boots and that zod config validation passes, without
+      # needing a database -- `--version` never reaches connectDatabase().
+      - name: Smoke test the image
+        run: docker run --rm --entrypoint node ledgercore-api:${{ github.sha }} --version
+
+      # Phase 12 found this the hard way in the OTHER direction: the Dockerfile
+      # was fixed while the tag compose actually used stayed stale for 42
+      # minutes. These assertions turn "we pruned it" into something the
+      # pipeline re-proves on every push.
+      - name: Assert image hygiene
+        run: |
+          set -e
+          img=ledgercore-api:${{ github.sha }}
+
+          echo "--- exactly one Prisma query engine ---"
+          n=$(docker run --rm --entrypoint sh "$img" -c \
+            "find node_modules -name 'libquery_engine*' | wc -l")
+          echo "engines: $n"
+          [ "$n" = "1" ] || { echo "FAIL: expected 1 query engine, got $n"; exit 1; }
+
+          echo "--- no schema-engine in a serving image ---"
+          docker run --rm --entrypoint sh "$img" -c \
+            "find node_modules -name 'schema-engine*' | grep . && exit 1 || exit 0"
+
+          echo "--- no package manager in the runtime ---"
+          docker run --rm --entrypoint sh "$img" -c \
+            "command -v npm && exit 1 || exit 0"
+
+          echo "--- does not run as root ---"
+          u=$(docker run --rm --entrypoint sh "$img" -c "id -un")
+          echo "user: $u"
+          [ "$u" = "node" ] || { echo "FAIL: expected node, got $u"; exit 1; }
+
+      # TODO(registry): nothing is pushed yet -- no ECR repository and no OIDC
+      # role exist. The Terraform in ledgercore/deploy/terraform has never been
+      # applied, so publishing here would be a claim, not a deploy. When it is
+      # applied this becomes, at job level:
+      #
+      #   permissions:
+      #     id-token: write      # OIDC -- no long-lived AWS keys in secrets
+      #     contents: read
+      #
+      #   - uses: aws-actions/configure-aws-credentials@v4
+      #     with:
+      #       role-to-assume: arn:aws:iam::<account-id>:role/github-actions-ecr-push
+      #       aws-region: <region>
+      #   - uses: aws-actions/amazon-ecr-login@v2
+      #     id: ecr
+      #   - uses: docker/build-push-action@v6
+      #     with: { context: ledgercore, target: runtime, push: true,
+      #             tags: "${{ steps.ecr.outputs.registry }}/ledgercore-api:${{ github.sha }}" }
+      #
+      # Tag with the commit sha, not only `latest`. A rollback needs an
+      # immutable reference and `latest` is not one -- it is a moving pointer,
+      # so "roll back to latest" is a sentence with no meaning. Gate the push on
+      # `github.ref == 'refs/heads/main'` so pull requests build but never
+      # publish. The worker ships from the same image with a different CMD, so
+      # retag rather than rebuild.
+
+  # ===========================================================================
+  # Web chain -- independent of the API chain, on purpose.
+  # ===========================================================================
+  web-build:
+    name: web / typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ledgercore-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ledgercore-web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+
+      # `pnpm build` here, which is `tsc -b && vite build`.
+      #
+      # This is the other half of a Phase 12 decision. The frontend Dockerfile
+      # runs `pnpm exec vite build` and deliberately SKIPS typechecking, so that
+      # an image build does not pay for it and a type error is not buried in a
+      # Docker build log. That choice is only safe because this job exists: CI
+      # is what stops untypechecked code reaching a registry.
+      - run: pnpm build
+
+  web-docker:
+    name: web / docker build
+    runs-on: ubuntu-latest
+    needs: web-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ledgercore-web
+          push: false
+          load: true
+          tags: ledgercore-web:${{ github.sha }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      # A static-file image has no `--version` to call, so the smoke test starts
+      # it and asks it to serve. `/healthz` proves nginx parsed its config;
+      # `config.js` proves the entrypoint ran and injected runtime config, which
+      # is the one piece of behaviour in this image that is not just files.
+      - name: Smoke test the image
+        run: |
+          set -e
+          docker run -d --name web-smoke -p 8080:8080 \
+            -e API_BASE_URL=http://example.invalid/api/v1 \
+            -e APP_ENV=ci \
+            ledgercore-web:${{ github.sha }}
+
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:8080/healthz >/dev/null && break
+            sleep 1
+          done
+
+          echo "--- healthz ---"
+          curl -sf http://localhost:8080/healthz
+
+          echo "--- runtime config was injected at start ---"
+          curl -sf http://localhost:8080/config.js | tee /tmp/cfg.js
+          grep -q "example.invalid" /tmp/cfg.js
+
+          echo "--- SPA fallback serves the app for a client route ---"
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/branches/abc)" = "200" ]
+
+          echo "--- but a missing asset is a 404, not index.html ---"
+          # If this ever returns 200 the browser gets HTML where it expected
+          # JavaScript and fails with "Unexpected token '<'", hiding the real
+          # cause (the file is not there).
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/assets/nope.js)" = "404" ]
+
+          echo "--- does not run as root ---"
+          [ "$(docker exec web-smoke id -un)" = "nginx" ]
+
+          docker rm -f web-smoke

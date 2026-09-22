@@ -1,0 +1,37 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    env: local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Each API node is scraped INDIVIDUALLY, not through the load balancer.
+  #
+  # Scraping through nginx would hit a different node each time, so every
+  # series would jump between instances and per-node problems would be
+  # invisible -- "one node has a blocked event loop" would average away into
+  # "everything is slightly slow". Histograms are additive, so Prometheus
+  # aggregates across instances at query time; that is the right place to do it.
+  - job_name: ledgercore-api
+    static_configs:
+      - targets: ['api-1:4000', 'api-2:4000', 'api-3:4000']
+    metrics_path: /metrics
+
+  # The worker exposes the async metrics that matter most -- queue depth,
+  # job durations, dead letters -- on its own port, because it has no other
+  # HTTP surface.
+  - job_name: ledgercore-worker
+    dns_sd_configs:
+      - names: ['tasks.worker']
+        type: A
+        port: 9101
+    static_configs:
+      - targets: ['ledgercore-worker-1:9101', 'ledgercore-worker-2:9101', 'ledgercore-worker-3:9101']
+    metrics_path: /metrics
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

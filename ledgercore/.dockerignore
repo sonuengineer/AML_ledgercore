@@ -1,0 +1,42 @@
+# Everything here is either rebuilt inside the image, irrelevant to it, or a
+# secret. Note that a fat build context is not just slow: every file listed in
+# the context participates in the cache key, so an untracked editor swapfile in
+# node_modules would bust the dependency layer on every build.
+
+# Rebuilt in the deps/prod-deps stages, and a host node_modules is very likely
+# the wrong platform's binaries (Windows here).
+node_modules
+**/node_modules
+
+# Rebuilt in the build stage.
+dist
+build
+*.tsbuildinfo
+
+# Never in an image. Compose and the task runner inject env at run time.
+.env
+.env.*
+!.env.example
+
+# Not shipped: tsconfig.build.json already excludes tests/ from dist, this
+# keeps them out of the build context as well.
+tests
+coverage
+vitest.config.ts
+vitest.int.config.ts
+
+# Not needed at build time and noisy in the cache key.
+.git
+.github
+.gitignore
+.vscode
+.idea
+*.log
+npm-debug.log*
+docker-compose*.yml
+Dockerfile
+.dockerignore
+docs
+*.md
+.DS_Store
+Thumbs.db

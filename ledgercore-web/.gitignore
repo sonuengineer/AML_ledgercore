@@ -1,0 +1,13 @@
+node_modules
+dist
+
+# `.env`, not just `.env.local`. Vite treats a committed `.env` as normal, but
+# this repository is PUBLIC and the file is a developer's local machine state.
+# `.env.example` is the committed, documented version.
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+*.local
+.DS_Store
