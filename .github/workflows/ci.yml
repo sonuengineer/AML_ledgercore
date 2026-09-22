@@ -243,8 +243,20 @@ jobs:
       - name: Apply migrations
         run: pnpm db:deploy
 
+      # `db:seed:all`, not `db:seed`.
+      #
+      # The first run that got this far failed all 18 ledger tests and 2 chaos
+      # tests with "An operation failed because it depends on one or more
+      # records that were required but not found". `db:seed` only creates
+      # branches, staff and roles; the ledger suite needs the chart of
+      # accounts and the AML suite needs its rules. Locally those had been
+      # seeded by hand, months of muscle memory ago, so nobody noticed the
+      # sequence was only in a developer's head.
+      #
+      # db:seed:all is that sequence written down once, so CI and a laptop
+      # cannot drift apart.
       - name: Seed
-        run: pnpm db:seed
+        run: pnpm db:seed:all
 
       - name: Integration tests
         run: pnpm test:int

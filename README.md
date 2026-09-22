@@ -84,7 +84,7 @@ cp .env.example .env
 docker compose up -d postgres redis redis-queue
 
 pnpm install
-pnpm db:deploy && pnpm db:seed
+pnpm db:deploy && pnpm db:seed:all   # branches+staff, chart of accounts, AML rules
 pnpm dev                       # API on :4000
 pnpm worker                    # background worker
 ```
@@ -112,6 +112,12 @@ cd ledgercore
 pnpm test        # unit -- no services needed
 pnpm test:int    # integration -- needs Postgres and both Redis instances
 ```
+
+Stop the compose `worker` before running `pnpm test:int`. It subscribes to the
+same queue Redis, so it competes with the test's own consumer for jobs and the
+redelivery test times out. CI never sees this -- its service containers are
+isolated per run -- which is exactly the kind of difference a local environment
+hides.
 
 ---
 

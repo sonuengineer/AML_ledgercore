@@ -20,6 +20,7 @@
     "db:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
     "db:seed": "tsx prisma/seed.ts",
+    "db:seed:all": "pnpm db:seed && pnpm db:seed:ledger && pnpm db:seed:aml",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset --force",
     "test:int": "vitest run --config vitest.int.config.ts",
