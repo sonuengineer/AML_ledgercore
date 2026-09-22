@@ -2,7 +2,7 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { config } from '../../config';
 import { moduleLogger } from '../logging/logger';
 import { ConcurrencyError, ConflictError, InternalError, NotFoundError } from '../errors/AppError';
-import { dbPingDuration, dbQueryDuration } from '../metrics/registry';
+import { dbConnectionRetries, dbPingDuration, dbQueryDuration } from '../metrics/registry';
 
 const log = moduleLogger('db');
 
@@ -24,6 +24,46 @@ const log = moduleLogger('db');
  */
 
 const SLOW_QUERY_MS = 200;
+
+/**
+ * Operations that may be retried after a closed connection.
+ *
+ * READS ONLY, and that restriction is the entire safety argument.
+ *
+ * "Server has closed the connection" is AMBIGUOUS: the statement may never
+ * have reached Postgres, or it may have executed and committed with the
+ * acknowledgement lost on the way back. There is no way to tell from the
+ * error. Retrying a read under that ambiguity is free -- the worst case is
+ * reading the same rows twice. Retrying a WRITE under it could post a voucher
+ * twice, which is the one failure this entire system exists to prevent.
+ *
+ * So writes are deliberately left to fail loudly. The caller already has the
+ * safe retry mechanism for them: the idempotency key from Phase 10, where the
+ * unique constraint -- not a guess about what the database did -- decides
+ * whether the work already happened.
+ */
+const RETRYABLE_READ_OPERATIONS = new Set([
+  'findUnique',
+  'findUniqueOrThrow',
+  'findFirst',
+  'findFirstOrThrow',
+  'findMany',
+  'count',
+  'aggregate',
+  'groupBy',
+]);
+
+/**
+ * Prisma reports a pooled connection that the server has already hung up as
+ * P1017. The message check is a belt-and-braces fallback: the same condition
+ * has surfaced as a bare PrismaClientKnownRequestError in the wild.
+ */
+const isClosedConnection = (error: unknown): boolean => {
+  const code = (error as { code?: unknown })?.code;
+  if (code === 'P1017') return true;
+  const message = (error as { message?: unknown })?.message;
+  return typeof message === 'string' && message.includes('Server has closed the connection');
+};
 
 /**
  * SERVER-SIDE limits, set once per session.
@@ -98,7 +138,72 @@ export const prisma = baseClient.$extends({
     async $allOperations({ model, operation, args, query }) {
       const startedAt = process.hrtime.bigint();
       try {
-        return await query(args);
+        try {
+          return await query(args);
+        } catch (error) {
+          /**
+           * One retry for a read whose pooled connection was already dead.
+           *
+           * Found in Phase 13, during a blue-green cutover experiment: 6 HTTP
+           * 500s out of ~31,000 requests (0.019%), every one of them
+           * `prisma.user.findUnique()` inside the authenticate middleware,
+           * failing with "Server has closed the connection".
+           *
+           * Prisma keeps its own pool of connections to pgBouncer. pgBouncer
+           * recycles connections underneath it, so a connection Prisma still
+           * believes is good can already be closed. Nothing has gone wrong
+           * with the request, the database or the deploy -- the client simply
+           * picked a dead handle out of its own pool. Nothing had ever
+           * noticed, because a rate this low disappears into a log file.
+           *
+           * A failure that is not the request's fault should not be the
+           * request's problem, so the read is attempted once more.
+           *
+           * Exactly ONE retry, not a loop: if the second attempt also finds a
+           * closed connection then pgBouncer or Postgres is genuinely down,
+           * and retrying harder in that state is how a blip becomes an outage.
+           *
+           * HONEST STATUS: THIS RETRY HAS NEVER BEEN OBSERVED RECOVERING.
+           *
+           * Three experiments, 46 retries fired, 0 recovered
+           * (db_connection_retries_total{outcome="recovered"} == 0):
+           *
+           *   1. restart pgBouncer under load      -> 16 retries, 16 failed
+           *   2. pgBouncer KILL/RESUME under load  -> 15 retries, 15 failed
+           *   3. same, with a 25ms pre-retry pause -> 19 retries, 19 failed
+           *
+           * Every failure that can be forced from outside kills the WHOLE pool
+           * at once, so the retry just draws another dead handle. That is a
+           * dependency outage, which this code correctly does not paper over.
+           * The bug actually seen in the wild was ONE recycled connection while
+           * the other nine were fine, and there is no way found so far to
+           * reproduce that on demand.
+           *
+           * It is kept because it is free and cannot make anything worse --
+           * reads only, one attempt, no delay. It is NOT kept on evidence that
+           * it works. The counter is the way that will eventually be settled:
+           * if `recovered` stays at zero in a real deployment, delete this.
+           *
+           * The 25ms pause from experiment 3 was REMOVED. It was added on the
+           * theory that the pool needed a moment to turn over; the measurement
+           * refuted it, and shipping latency for an unmeasured benefit is not a
+           * trade, it is a cost.
+           */
+          if (!isClosedConnection(error) || !RETRYABLE_READ_OPERATIONS.has(operation ?? '')) {
+            throw error;
+          }
+
+          log.warn({ model, operation }, 'pooled connection was closed, retrying read once');
+
+          try {
+            const result = await query(args);
+            dbConnectionRetries.inc({ outcome: 'recovered' });
+            return result;
+          } catch (retryError) {
+            dbConnectionRetries.inc({ outcome: 'failed' });
+            throw retryError;
+          }
+        }
       } finally {
         const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
 

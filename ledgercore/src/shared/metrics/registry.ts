@@ -112,6 +112,21 @@ export const httpErrors = new Counter({
 // Dependencies
 // ---------------------------------------------------------------------------
 
+/**
+ * Stale pooled connections, retried.
+ *
+ * A counter and not a log line only, because the question that matters is
+ * "is this getting worse", which a rate() answers and grep does not. It is
+ * labelled by outcome: a `recovered` retry is invisible to the user, a
+ * `failed` one became a 500.
+ */
+export const dbConnectionRetries = new Counter({
+  name: 'db_connection_retries_total',
+  help: 'Read queries retried after the pooled connection was found closed',
+  labelNames: ['outcome'] as const,
+  registers: [registry],
+});
+
 export const dbQueryDuration = new Histogram({
   name: 'db_query_duration_seconds',
   help: 'Database query duration in seconds',
